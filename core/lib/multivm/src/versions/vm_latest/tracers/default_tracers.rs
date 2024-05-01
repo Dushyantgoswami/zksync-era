@@ -3,7 +3,8 @@ use std::{
     marker::PhantomData,
 };
 
-use zk_evm_1_4_0::{
+use zk_evm_1_5_0::{
+    aux_structures::Timestamp,
     tracing::{
         AfterDecodingData, AfterExecutionData, BeforeExecutionData, Tracer, VmLocalStateData,
     },
@@ -12,13 +13,13 @@ use zk_evm_1_4_0::{
     zkevm_opcode_defs::{decoding::EncodingModeProduction, Opcode, RetOpcode},
 };
 use zksync_state::{StoragePtr, WriteStorage};
-use zksync_types::Timestamp;
 
 use super::PubdataTracer;
 use crate::{
+    glue::GlueInto,
     interface::{
+        dyn_tracers::vm_1_5_0::DynTracer,
         tracer::{TracerExecutionStopReason, VmExecutionStopReason},
-        traits::tracers::dyn_tracers::vm_1_4_0::DynTracer,
         types::tracer::TracerExecutionStatus,
         Halt, VmExecutionMode,
     },
@@ -28,13 +29,11 @@ use crate::{
         old_vm::{history_recorder::HistoryMode, memory::SimpleMemory},
         tracers::{
             dispatcher::TracerDispatcher,
-            utils::{
-                computational_gas_price, gas_spent_on_bytecodes_and_long_messages_this_opcode,
-                print_debug_if_needed, VmHook,
-            },
-            RefundsTracer, ResultTracer,
+            utils::{computational_gas_price, print_debug_if_needed, VmHook},
+            CircuitsTracer, RefundsTracer, ResultTracer,
         },
         types::internals::ZkSyncVmState,
+        vm::MultiVMSubversion,
         VmTracer,
     },
 };
@@ -44,7 +43,6 @@ pub(crate) struct DefaultExecutionTracer<S: WriteStorage, H: HistoryMode> {
     tx_has_been_processed: bool,
     execution_mode: VmExecutionMode,
 
-    pub(crate) gas_spent_on_bytecodes_and_long_messages: u32,
     // Amount of gas used during account validation.
     pub(crate) computational_gas_used: u32,
     // Maximum number of gas that we're allowed to use during account validation.
@@ -54,7 +52,7 @@ pub(crate) struct DefaultExecutionTracer<S: WriteStorage, H: HistoryMode> {
     pub(crate) result_tracer: ResultTracer<S>,
     // This tracer is designed specifically for calculating refunds. Its separation from the custom tracer
     // ensures static dispatch, enhancing performance by avoiding dynamic dispatch overhead.
-    // Additionally, being an internal tracer, it saves the results directly to VmResultAndLogs.
+    // Additionally, being an internal tracer, it saves the results directly to `VmResultAndLogs`.
     pub(crate) refund_tracer: Option<RefundsTracer<S>>,
     // The pubdata tracer is responsible for inserting the pubdata packing information into the bootloader
     // memory at the end of the batch. Its separation from the custom tracer
@@ -62,6 +60,11 @@ pub(crate) struct DefaultExecutionTracer<S: WriteStorage, H: HistoryMode> {
     pub(crate) pubdata_tracer: Option<PubdataTracer<S>>,
     pub(crate) dispatcher: TracerDispatcher<S, H>,
     ret_from_the_bootloader: Option<RetOpcode>,
+    // This tracer tracks what opcodes were executed and calculates how much circuits will be generated.
+    // It only takes into account circuits that are generated for actual execution. It doesn't
+    // take into account e.g circuits produced by the initial bootloader memory commitment.
+    pub(crate) circuits_tracer: CircuitsTracer<S, H>,
+    subversion: MultiVMSubversion,
     storage: StoragePtr<S>,
     _phantom: PhantomData<H>,
 }
@@ -74,20 +77,22 @@ impl<S: WriteStorage, H: HistoryMode> DefaultExecutionTracer<S, H> {
         storage: StoragePtr<S>,
         refund_tracer: Option<RefundsTracer<S>>,
         pubdata_tracer: Option<PubdataTracer<S>>,
+        subversion: MultiVMSubversion,
     ) -> Self {
         Self {
             tx_has_been_processed: false,
             execution_mode,
-            gas_spent_on_bytecodes_and_long_messages: 0,
             computational_gas_used: 0,
             tx_validation_gas_limit: computational_gas_limit,
             in_account_validation: false,
             final_batch_info_requested: false,
-            result_tracer: ResultTracer::new(execution_mode),
+            subversion,
+            result_tracer: ResultTracer::new(execution_mode, subversion),
             refund_tracer,
             dispatcher,
             pubdata_tracer,
             ret_from_the_bootloader: None,
+            circuits_tracer: CircuitsTracer::new(),
             storage,
             _phantom: PhantomData,
         }
@@ -101,10 +106,6 @@ impl<S: WriteStorage, H: HistoryMode> DefaultExecutionTracer<S, H> {
         self.computational_gas_used > self.tx_validation_gas_limit
     }
 
-    pub(crate) fn gas_spent_on_pubdata(&self, vm_local_state: &VmLocalState) -> u32 {
-        self.gas_spent_on_bytecodes_and_long_messages + vm_local_state.spent_pubdata_counter
-    }
-
     fn set_fictive_l2_block(
         &mut self,
         state: &mut ZkSyncVmState<S, H>,
@@ -115,9 +116,11 @@ impl<S: WriteStorage, H: HistoryMode> DefaultExecutionTracer<S, H> {
         let l2_block = bootloader_state.insert_fictive_l2_block();
         let mut memory = vec![];
         apply_l2_block(&mut memory, l2_block, txs_index);
-        state
-            .memory
-            .populate_page(BOOTLOADER_HEAP_PAGE as usize, memory, current_timestamp);
+        state.memory.populate_page(
+            BOOTLOADER_HEAP_PAGE as usize,
+            memory,
+            current_timestamp.glue_into(),
+        );
         self.final_batch_info_requested = false;
     }
 
@@ -161,14 +164,15 @@ impl<S: WriteStorage, H: HistoryMode> Debug for DefaultExecutionTracer<S, H> {
 /// The macro passes the function call to all tracers.
 macro_rules! dispatch_tracers {
     ($self:ident.$function:ident($( $params:expr ),*)) => {
-       $self.result_tracer.$function($( $params ),*);
-       $self.dispatcher.$function($( $params ),*);
+        $self.result_tracer.$function($( $params ),*);
+        $self.dispatcher.$function($( $params ),*);
         if let Some(tracer) = &mut $self.refund_tracer {
             tracer.$function($( $params ),*);
         }
         if let Some(tracer) = &mut $self.pubdata_tracer {
             tracer.$function($( $params ),*);
         }
+        $self.circuits_tracer.$function($( $params ),*);
     };
 }
 
@@ -207,8 +211,14 @@ impl<S: WriteStorage, H: HistoryMode> Tracer for DefaultExecutionTracer<S, H> {
                 .saturating_add(computational_gas_price(state, &data));
         }
 
-        let hook = VmHook::from_opcode_memory(&state, &data);
-        print_debug_if_needed(&hook, &state, memory);
+        let hook = VmHook::from_opcode_memory(&state, &data, self.subversion);
+        print_debug_if_needed(
+            &hook,
+            &state,
+            memory,
+            self.result_tracer.get_latest_result_ptr(),
+            self.subversion,
+        );
 
         match hook {
             VmHook::TxHasEnded => self.tx_has_been_processed = true,
@@ -217,9 +227,6 @@ impl<S: WriteStorage, H: HistoryMode> Tracer for DefaultExecutionTracer<S, H> {
             VmHook::FinalBatchInfo => self.final_batch_info_requested = true,
             _ => {}
         }
-
-        self.gas_spent_on_bytecodes_and_long_messages +=
-            gas_spent_on_bytecodes_and_long_messages_this_opcode(&state, &data);
 
         dispatch_tracers!(self.before_execution(state, data, memory, self.storage.clone()));
     }
@@ -231,7 +238,7 @@ impl<S: WriteStorage, H: HistoryMode> Tracer for DefaultExecutionTracer<S, H> {
         memory: &Self::SupportedMemory,
     ) {
         if let VmExecutionMode::Bootloader = self.execution_mode {
-            let (next_opcode, _, _) = zk_evm_1_4_0::vm_state::read_and_decode(
+            let (next_opcode, _, _) = zk_evm_1_5_0::vm_state::read_and_decode(
                 state.vm_local_state,
                 memory,
                 &mut DummyTracer,
@@ -277,6 +284,12 @@ impl<S: WriteStorage, H: HistoryMode> DefaultExecutionTracer<S, H> {
                 .finish_cycle(state, bootloader_state)
                 .stricter(&result);
         }
+
+        result = self
+            .circuits_tracer
+            .finish_cycle(state, bootloader_state)
+            .stricter(&result);
+
         result.stricter(&self.should_stop_execution())
     }
 
@@ -291,7 +304,7 @@ impl<S: WriteStorage, H: HistoryMode> DefaultExecutionTracer<S, H> {
 }
 
 fn current_frame_is_bootloader(local_state: &VmLocalState) -> bool {
-    // The current frame is bootloader if the callstack depth is 1.
+    // The current frame is bootloader if the call stack depth is 1.
     // Some of the near calls inside the bootloader can be out of gas, which is totally normal behavior
     // and it shouldn't result in `is_bootloader_out_of_gas` becoming true.
     local_state.callstack.inner.len() == 1

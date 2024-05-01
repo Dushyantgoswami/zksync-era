@@ -5,31 +5,44 @@ use std::{
     time::Duration,
 };
 
+use multivm::interface::VmExecutionResultAndLogs;
 use vise::{
     Buckets, Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Histogram, LatencyObserver,
     Metrics,
 };
 use zksync_mempool::MempoolStore;
+use zksync_shared_metrics::InteractionType;
+use zksync_types::{tx::tx_execution_info::DeduplicatedWritesMetrics, ProtocolVersionId};
 
 use super::seal_criteria::SealResolution;
-use crate::metrics::InteractionType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
 #[metrics(label = "stage", rename_all = "snake_case")]
 pub(crate) enum TxExecutionStage {
     Execution,
     TxRollback,
-    #[metrics(name = "dryrun_make_snapshot")]
-    DryRunMakeSnapshot,
-    #[metrics(name = "dryrun_execute_block_tip")]
-    DryRunExecuteBlockTip,
-    #[metrics(name = "dryrun_get_execution_metrics")]
-    DryRunGetExecutionMetrics,
-    #[metrics(name = "dryrun_rollback_to_the_latest_snapshot")]
-    DryRunRollbackToLatestSnapshot,
-    #[metrics(name = "dryrun_rollback")]
-    DryRunRollback,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
+#[metrics(label = "tx_execution_type", rename_all = "snake_case")]
+pub(crate) enum TxExecutionType {
+    L1,
+    L2,
+}
+
+impl TxExecutionType {
+    pub fn from_is_l1(is_l1: bool) -> TxExecutionType {
+        match is_l1 {
+            true => TxExecutionType::L1,
+            false => TxExecutionType::L2,
+        }
+    }
+}
+
+const INCLUSION_DELAY_BUCKETS: Buckets = Buckets::values(&[
+    0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9,
+    2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 20.0, 30.0, 60.0, 120.0, 240.0,
+]);
 
 /// General-purpose state keeper metrics.
 #[derive(Debug, Metrics)]
@@ -49,14 +62,19 @@ pub(crate) struct StateKeeperMetrics {
     /// Time spent waiting for the hash of a previous L1 batch.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub wait_for_prev_hash_time: Histogram<Duration>,
-    /// Time spent waiting for the header of a previous miniblock.
+    /// Time spent waiting for the header of a previous L2 block.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub load_previous_miniblock_header: Histogram<Duration>,
+    /// The time it takes for transactions to be included in a block. Representative of the time user must wait before their transaction is confirmed.
+    #[metrics(buckets = INCLUSION_DELAY_BUCKETS)]
+    pub transaction_inclusion_delay: Family<TxExecutionType, Histogram<Duration>>,
     /// Time spent by the state keeper on transaction execution.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub tx_execution_time: Family<TxExecutionStage, Histogram<Duration>>,
     /// Number of times gas price was reported as too high.
     pub gas_price_too_high: Counter,
+    /// Number of times blob base fee was reported as too high.
+    pub blob_base_fee_too_high: Counter,
 }
 
 #[vise::register]
@@ -157,11 +175,12 @@ pub(super) static AGGREGATION_METRICS: vise::Global<TxAggregationMetrics> = vise
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
 #[metrics(label = "stage", rename_all = "snake_case")]
 pub(super) enum L1BatchSealStage {
-    VmFinalization,
-    FictiveMiniblock,
+    #[metrics(name = "fictive_miniblock")]
+    FictiveL2Block,
     LogDeduplication,
     InsertL1BatchHeader,
-    SetL1BatchNumberForMiniblocks,
+    #[metrics(name = "set_l1_batch_number_for_miniblocks")]
+    SetL1BatchNumberForL2Blocks,
     MarkTxsAsExecutedInL1Batch,
     InsertProtectiveReads,
     FilterWrittenSlots,
@@ -226,7 +245,7 @@ pub(crate) static L1_BATCH_METRICS: vise::Global<L1BatchMetrics> = vise::Global:
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
 #[metrics(label = "stage", rename_all = "snake_case")]
-pub(super) enum MiniblockQueueStage {
+pub(super) enum L2BlockQueueStage {
     Submit,
     WaitForAllCommands,
     NextCommand,
@@ -234,67 +253,68 @@ pub(super) enum MiniblockQueueStage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue)]
 #[metrics(rename_all = "snake_case")]
-pub(super) enum MiniblockSealStage {
+pub(super) enum L2BlockSealStage {
     PreInsertTxs,
-    InsertMiniblockHeader,
-    MarkTransactionsInMiniblock,
+    #[metrics(name = "insert_miniblock_header")]
+    InsertL2BlockHeader,
+    #[metrics(name = "mark_transactions_in_miniblock")]
+    MarkTransactionsInL2Block,
     InsertStorageLogs,
-    ApplyStorageLogs,
     InsertFactoryDeps,
-    ExtractContractsDeployed,
     ExtractAddedTokens,
     InsertTokens,
     ExtractEvents,
     InsertEvents,
     ExtractL2ToL1Logs,
     InsertL2ToL1Logs,
-    InsertConsensus,
-    CommitMiniblock,
+    #[metrics(name = "commit_miniblock")]
+    CommitL2Block,
+    ReportTxMetrics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelSet)]
-struct MiniblockSealLabels {
-    stage: MiniblockSealStage,
+struct L2BlockSealLabels {
+    stage: L2BlockSealStage,
     is_fictive: &'static str,
 }
 
 #[derive(Debug, Metrics)]
 #[metrics(prefix = "server_state_keeper_miniblock")]
-pub(super) struct MiniblockMetrics {
-    /// Delta between sealing consecutive miniblocks.
+pub(super) struct L2BlockMetrics {
+    /// Delta between sealing consecutive L2 blocks.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub seal_delta: Histogram<Duration>,
-    /// Current capacity of the seal queue for miniblocks.
+    /// Current capacity of the seal queue for L2 blocks.
     pub seal_queue_capacity: Gauge<usize>,
-    /// Latency of a certain operation concerning the seal queue for miniblocks.
+    /// Latency of a certain operation concerning the seal queue for L2 blocks.
     #[metrics(buckets = Buckets::LATENCIES)]
-    pub seal_queue_latency: Family<MiniblockQueueStage, Histogram<Duration>>,
-    /// Number of transactions in a single miniblock.
+    pub seal_queue_latency: Family<L2BlockQueueStage, Histogram<Duration>>,
+    /// Number of transactions in a single L2 block.
     #[metrics(buckets = Buckets::linear(0.0..=50.0, 5.0))]
     pub transactions_in_miniblock: Histogram<usize>,
-    /// Total latency of sealing a miniblock.
+    /// Total latency of sealing an L2 block.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub sealed_time: Histogram<Duration>,
-    /// Latency of sealing a miniblock split by the stage.
+    /// Latency of sealing an L2 block split by the stage.
     #[metrics(buckets = Buckets::LATENCIES)]
-    sealed_time_stage: Family<MiniblockSealLabels, Histogram<Duration>>,
-    /// Number of entities stored in Postgres during a specific stage of sealing a miniblock.
+    sealed_time_stage: Family<L2BlockSealLabels, Histogram<Duration>>,
+    /// Number of entities stored in Postgres during a specific stage of sealing an L2 block.
     #[metrics(buckets = COUNT_BUCKETS)]
-    sealed_entity_count: Family<MiniblockSealLabels, Histogram<usize>>,
-    /// Latency of sealing a miniblock split by the stage and divided by the number of entries
+    sealed_entity_count: Family<L2BlockSealLabels, Histogram<usize>>,
+    /// Latency of sealing an L2 block split by the stage and divided by the number of entries
     /// stored in the stage.
     #[metrics(buckets = Buckets::LATENCIES)]
-    sealed_entity_per_unit: Family<MiniblockSealLabels, Histogram<Duration>>,
+    sealed_entity_per_unit: Family<L2BlockSealLabels, Histogram<Duration>>,
 }
 
-impl MiniblockMetrics {
-    pub(super) fn start(&self, stage: MiniblockSealStage, is_fictive: bool) -> SealProgress<'_> {
-        let labels = MiniblockSealLabels {
+impl L2BlockMetrics {
+    pub(super) fn start(&self, stage: L2BlockSealStage, is_fictive: bool) -> SealProgress<'_> {
+        let labels = L2BlockSealLabels {
             stage,
             is_fictive: if is_fictive { "true" } else { "false" },
         };
         SealProgress {
-            target: "Miniblock",
+            target: "L2 block",
             stage_name: format!("{stage:?}"),
             latency: self.sealed_time_stage[&labels].start(),
             entity_count: &self.sealed_entity_count[&labels],
@@ -304,9 +324,9 @@ impl MiniblockMetrics {
 }
 
 #[vise::register]
-pub(super) static MINIBLOCK_METRICS: vise::Global<MiniblockMetrics> = vise::Global::new();
+pub(super) static L2_BLOCK_METRICS: vise::Global<L2BlockMetrics> = vise::Global::new();
 
-/// Tracking progress of L1 batch or miniblock sealing.
+/// Tracking progress of L1 batch or L2 block sealing.
 #[must_use = "Progress must be `observe()`d"]
 #[derive(Debug)]
 pub(super) struct SealProgress<'a> {
@@ -344,7 +364,8 @@ impl SealProgress<'_> {
 #[metrics(label = "command", rename_all = "snake_case")]
 pub(super) enum ExecutorCommand {
     ExecuteTx,
-    StartNextMiniblock,
+    #[metrics(name = "start_next_miniblock")]
+    StartNextL2Block,
     RollbackLastTx,
     FinishBatch,
 }
@@ -372,3 +393,54 @@ pub(super) struct ExecutorMetrics {
 
 #[vise::register]
 pub(super) static EXECUTOR_METRICS: vise::Global<ExecutorMetrics> = vise::Global::new();
+
+#[derive(Debug, Metrics)]
+#[metrics(prefix = "batch_tip")]
+pub(crate) struct BatchTipMetrics {
+    #[metrics(buckets = Buckets::exponential(60000.0..=80000000.0, 2.0))]
+    gas_used: Histogram<usize>,
+    #[metrics(buckets = Buckets::exponential(1.0..=60000.0, 2.0))]
+    pubdata_published: Histogram<usize>,
+    #[metrics(buckets = Buckets::exponential(1.0..=4096.0, 2.0))]
+    circuit_statistic: Histogram<usize>,
+    #[metrics(buckets = Buckets::exponential(1.0..=4096.0, 2.0))]
+    execution_metrics_size: Histogram<usize>,
+    #[metrics(buckets = Buckets::exponential(1.0..=60000.0, 2.0))]
+    block_writes_metrics_positive_size: Histogram<usize>,
+    #[metrics(buckets = Buckets::exponential(1.0..=60000.0, 2.0))]
+    block_writes_metrics_negative_size: Histogram<usize>,
+}
+
+impl BatchTipMetrics {
+    pub fn observe(&self, execution_result: &VmExecutionResultAndLogs) {
+        self.gas_used
+            .observe(execution_result.statistics.gas_used as usize);
+        self.pubdata_published
+            .observe(execution_result.statistics.pubdata_published as usize);
+        self.circuit_statistic
+            .observe(execution_result.statistics.circuit_statistic.total());
+        self.execution_metrics_size
+            .observe(execution_result.get_execution_metrics(None).size());
+    }
+
+    pub fn observe_writes_metrics(
+        &self,
+        initial_writes_metrics: &DeduplicatedWritesMetrics,
+        applied_writes_metrics: &DeduplicatedWritesMetrics,
+        protocol_version_id: ProtocolVersionId,
+    ) {
+        let size_diff = applied_writes_metrics.size(protocol_version_id) as i128
+            - initial_writes_metrics.size(protocol_version_id) as i128;
+
+        if size_diff > 0 {
+            self.block_writes_metrics_positive_size
+                .observe(size_diff as usize);
+        } else {
+            self.block_writes_metrics_negative_size
+                .observe(size_diff.unsigned_abs() as usize);
+        }
+    }
+}
+
+#[vise::register]
+pub(crate) static BATCH_TIP_METRICS: vise::Global<BatchTipMetrics> = vise::Global::new();

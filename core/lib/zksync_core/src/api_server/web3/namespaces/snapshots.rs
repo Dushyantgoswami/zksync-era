@@ -1,102 +1,81 @@
+use anyhow::Context as _;
+use zksync_dal::{CoreDal, DalError};
 use zksync_types::{
     snapshots::{AllSnapshots, SnapshotHeader, SnapshotStorageLogsChunkMetadata},
     L1BatchNumber,
 };
 use zksync_web3_decl::error::Web3Error;
 
-use crate::{
-    api_server::web3::{
-        backend_jsonrpc::error::internal_error, metrics::API_METRICS, state::RpcState,
-    },
-    l1_gas_price::L1GasPriceProvider,
-};
+use crate::api_server::web3::{backend_jsonrpsee::MethodTracer, state::RpcState};
 
-#[derive(Debug)]
-pub struct SnapshotsNamespace<G> {
-    state: RpcState<G>,
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotsNamespace {
+    state: RpcState,
 }
 
-impl<G> Clone for SnapshotsNamespace<G> {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-        }
-    }
-}
-impl<G: L1GasPriceProvider> SnapshotsNamespace<G> {
-    pub fn new(state: RpcState<G>) -> Self {
+impl SnapshotsNamespace {
+    pub fn new(state: RpcState) -> Self {
         Self { state }
     }
 
+    pub(crate) fn current_method(&self) -> &MethodTracer {
+        &self.state.current_method
+    }
+
     pub async fn get_all_snapshots_impl(&self) -> Result<AllSnapshots, Web3Error> {
-        let method_name = "get_all_snapshots";
-        let method_latency = API_METRICS.start_call(method_name);
-        let mut storage_processor = self
-            .state
-            .connection_pool
-            .access_storage_tagged("api")
-            .await
-            .map_err(|err| internal_error(method_name, err))?;
+        let mut storage_processor = self.state.acquire_connection().await?;
         let mut snapshots_dal = storage_processor.snapshots_dal();
-        let response = snapshots_dal
-            .get_all_snapshots()
+        Ok(snapshots_dal
+            .get_all_complete_snapshots()
             .await
-            .map_err(|err| internal_error(method_name, err));
-        method_latency.observe();
-        response
+            .map_err(DalError::generalize)?)
     }
 
     pub async fn get_snapshot_by_l1_batch_number_impl(
         &self,
         l1_batch_number: L1BatchNumber,
     ) -> Result<Option<SnapshotHeader>, Web3Error> {
-        let method_name = "get_snapshot_by_l1_batch_number";
-        let method_latency = API_METRICS.start_call(method_name);
-        let mut storage_processor = self
-            .state
-            .connection_pool
-            .access_storage_tagged("api")
-            .await
-            .map_err(|err| internal_error(method_name, err))?;
-        let mut snapshots_dal = storage_processor.snapshots_dal();
-        let snapshot_metadata = snapshots_dal
+        let mut storage_processor = self.state.acquire_connection().await?;
+        let snapshot_metadata = storage_processor
+            .snapshots_dal()
             .get_snapshot_metadata(l1_batch_number)
             .await
-            .map_err(|err| internal_error(method_name, err))?;
-        if let Some(snapshot_metadata) = snapshot_metadata {
-            let snapshot_files = snapshot_metadata.storage_logs_filepaths.clone();
-            let chunks = snapshot_files
-                .iter()
-                .enumerate()
-                .map(|(chunk_id, filepath)| SnapshotStorageLogsChunkMetadata {
-                    chunk_id: chunk_id as u64,
-                    filepath: filepath.clone(),
-                })
-                .collect();
-            let l1_batch_with_metadata = storage_processor
-                .blocks_dal()
-                .get_l1_batch_metadata(l1_batch_number)
-                .await
-                .map_err(|err| internal_error(method_name, err))?
-                .unwrap();
-            let miniblock_number = storage_processor
-                .blocks_dal()
-                .get_miniblock_range_of_l1_batch(l1_batch_number)
-                .await
-                .map_err(|err| internal_error(method_name, err))?
-                .unwrap()
-                .1;
-            method_latency.observe();
-            Ok(Some(SnapshotHeader {
-                l1_batch_number: snapshot_metadata.l1_batch_number,
-                miniblock_number,
-                last_l1_batch_with_metadata: l1_batch_with_metadata,
-                storage_logs_chunks: chunks,
-                factory_deps_filepath: snapshot_metadata.factory_deps_filepath,
-            }))
-        } else {
-            method_latency.observe();
-            Ok(None)
+            .map_err(DalError::generalize)?;
+
+        let Some(snapshot_metadata) = snapshot_metadata else {
+            return Ok(None);
+        };
+
+        let snapshot_files = snapshot_metadata.storage_logs_filepaths;
+        let is_complete = snapshot_files.iter().all(Option::is_some);
+        if !is_complete {
+            // We don't return incomplete snapshots via API.
+            return Ok(None);
         }
+
+        let chunks = snapshot_files
+            .into_iter()
+            .enumerate()
+            .filter_map(|(chunk_id, filepath)| {
+                Some(SnapshotStorageLogsChunkMetadata {
+                    chunk_id: chunk_id as u64,
+                    filepath: filepath?,
+                })
+            })
+            .collect();
+        let (_, l2_block_number) = storage_processor
+            .blocks_dal()
+            .get_l2_block_range_of_l1_batch(l1_batch_number)
+            .await
+            .map_err(DalError::generalize)?
+            .with_context(|| format!("missing L2 blocks for L1 batch #{l1_batch_number}"))?;
+
+        Ok(Some(SnapshotHeader {
+            version: snapshot_metadata.version.into(),
+            l1_batch_number: snapshot_metadata.l1_batch_number,
+            l2_block_number,
+            storage_logs_chunks: chunks,
+            factory_deps_filepath: snapshot_metadata.factory_deps_filepath,
+        }))
     }
 }

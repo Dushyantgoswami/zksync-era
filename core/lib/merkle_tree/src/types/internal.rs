@@ -85,6 +85,15 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Returns the version of the tree that is currently being recovered.
+    pub fn recovered_version(&self) -> Option<u64> {
+        if self.tags.as_ref()?.is_recovering {
+            Some(self.version_count.checked_sub(1)?)
+        } else {
+            None
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new(version_count: u64, hasher: &dyn HashTree) -> Self {
         Self {
@@ -305,12 +314,12 @@ impl NodeKey {
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn to_db_key(self) -> Vec<u8> {
         let nibbles_byte_len = (self.nibbles.nibble_count + 1) / 2;
-        // ^ equivalent to ceil(self.nibble_count / 2)
+        // ^ equivalent to `ceil(self.nibble_count / 2)`
         let mut bytes = Vec::with_capacity(9 + nibbles_byte_len);
         // ^ 8 bytes for `version` + 1 byte for nibble count
         bytes.extend_from_slice(&self.version.to_be_bytes());
         bytes.push(self.nibbles.nibble_count as u8);
-        // ^ conversion is safe: nibble_count <= 64
+        // ^ conversion is safe: `nibble_count <= 64`
         bytes.extend_from_slice(&self.nibbles.bytes[..nibbles_byte_len]);
         bytes
     }
@@ -552,6 +561,28 @@ impl StaleNodeKey {
     }
 }
 
+/// Profiled Merkle tree operation used in `Database::start_profiling()`.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum ProfiledTreeOperation {
+    /// Loading ancestors for nodes inserted or updated in the tree.
+    LoadAncestors,
+    /// Getting entries from the tree without Merkle proofs.
+    GetEntries,
+    /// Getting entries from the tree with Merkle proofs.
+    GetEntriesWithProofs,
+}
+
+impl ProfiledTreeOperation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LoadAncestors => "load_ancestors",
+            Self::GetEntries => "get_entries",
+            Self::GetEntriesWithProofs => "get_entries_with_proofs",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use zksync_types::U256;
@@ -559,7 +590,7 @@ mod tests {
     use super::*;
 
     // `U256` uses little-endian `u64` ordering; i.e., this is
-    // 0x_dead_beef_0000_0000_.._0000.
+    // `0x_dead_beef_0000_0000_.._0000.`
     const TEST_KEY: Key = U256([0, 0, 0, 0x_dead_beef_0000_0000]);
 
     #[test]

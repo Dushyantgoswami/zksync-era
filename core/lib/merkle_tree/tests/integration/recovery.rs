@@ -33,7 +33,7 @@ fn recovery_basics() {
     assert_eq!(recovery.last_processed_key(), Some(greatest_key));
     assert_eq!(recovery.root_hash(), *expected_hash);
 
-    let tree = recovery.finalize();
+    let tree = MerkleTree::new(recovery.finalize());
     tree.verify_consistency(recovered_version, true).unwrap();
 }
 
@@ -65,7 +65,7 @@ fn test_recovery_in_chunks(mut db: impl PruneDatabase, kind: RecoveryKind, chunk
     assert_eq!(recovery.last_processed_key(), Some(greatest_key));
     assert_eq!(recovery.root_hash(), *expected_hash);
 
-    let mut tree = recovery.finalize();
+    let mut tree = MerkleTree::new(recovery.finalize());
     tree.verify_consistency(recovered_version, true).unwrap();
     // Check that new tree versions can be built and function as expected.
     test_tree_after_recovery(&mut tree, recovered_version, *expected_hash);
@@ -106,7 +106,9 @@ fn test_tree_after_recovery<DB: Database>(
         } else {
             let instructions = convert_to_writes(chunk);
             let output = tree.extend_with_proofs(instructions.clone());
-            output.verify_proofs(&Blake2Hasher, prev_root_hash, &instructions);
+            output
+                .verify_proofs(&Blake2Hasher, prev_root_hash, &instructions)
+                .unwrap();
             output.root_hash().unwrap()
         };
 
@@ -131,7 +133,7 @@ mod rocksdb {
     #[test_casing(8, test_casing::Product((RecoveryKind::ALL, [6, 10, 17, 42])))]
     fn recovery_in_chunks(kind: RecoveryKind, chunk_size: usize) {
         let temp_dir = TempDir::new().unwrap();
-        let db = RocksDBWrapper::new(temp_dir.path());
+        let db = RocksDBWrapper::new(temp_dir.path()).unwrap();
         test_recovery_in_chunks(db, kind, chunk_size);
     }
 }

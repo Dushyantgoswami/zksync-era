@@ -10,11 +10,16 @@
  *
  */
 import * as utils from 'zk/build/utils';
+import * as fs from 'fs';
 import { TestMaster } from '../src/index';
 
-import * as zksync from 'zksync-web3';
+import * as zksync from 'zksync-ethers';
 import { BigNumber, ethers } from 'ethers';
 import { Token } from '../src/types';
+
+const UINT32_MAX = BigNumber.from(2).pow(32).sub(1);
+
+const logs = fs.createWriteStream('fees.log', { flags: 'a' });
 
 // Unless `RUN_FEE_TEST` is provided, skip the test suit
 const testFees = process.env.RUN_FEE_TEST ? describe : describe.skip;
@@ -73,15 +78,39 @@ testFees('Test fees', () => {
             })
         ).wait();
 
-        let reports = ['ETH transfer:\n\n', 'ERC20 transfer:\n\n'];
+        // Warming up slots for the receiver
+        await (
+            await alice.sendTransaction({
+                to: receiver,
+                value: BigNumber.from(1)
+            })
+        ).wait();
+
+        await (
+            await alice.sendTransaction({
+                data: aliceErc20.interface.encodeFunctionData('transfer', [receiver, BigNumber.from(1)]),
+                to: tokenDetails.l2Address
+            })
+        ).wait();
+
+        let reports = [
+            'ETH transfer (to new):\n\n',
+            'ETH transfer (to old):\n\n',
+            'ERC20 transfer (to new):\n\n',
+            'ERC20 transfer (to old):\n\n'
+        ];
         for (const gasPrice of L1_GAS_PRICES_TO_TEST) {
             reports = await appendResults(
                 alice,
-                [feeTestL1Receipt, feeTestL1ReceiptERC20],
+                [feeTestL1Receipt, feeTestL1Receipt, feeTestL1ReceiptERC20, feeTestL1ReceiptERC20],
                 // We always regenerate new addresses for transaction requests in order to estimate the cost for a new account
                 [
                     {
                         to: ethers.Wallet.createRandom().address,
+                        value: BigNumber.from(1)
+                    },
+                    {
+                        to: receiver,
                         value: BigNumber.from(1)
                     },
                     {
@@ -90,6 +119,10 @@ testFees('Test fees', () => {
                             BigNumber.from(1)
                         ]),
                         to: tokenDetails.l2Address
+                    },
+                    {
+                        data: aliceErc20.interface.encodeFunctionData('transfer', [receiver, BigNumber.from(1)]),
+                        to: tokenDetails.l2Address
                     }
                 ],
                 gasPrice,
@@ -97,12 +130,66 @@ testFees('Test fees', () => {
             );
         }
 
-        await setInternalL1GasPrice(alice._providerL2(), undefined, true);
-
         console.log(`Full report: \n\n${reports.join('\n\n')}`);
     });
 
+    test('Test gas consumption under large L1 gas price', async () => {
+        if (process.env.CHAIN_STATE_KEEPER_L1_BATCH_COMMIT_DATA_GENERATOR_MODE === 'Validium') {
+            // We skip this test for Validium mode, since L1 gas price has little impact on the gasLimit in this mode.
+            return;
+        }
+
+        // In this test we check that the server works fine when the required gasLimit is over u32::MAX.
+        // Under normal server behavior, the maximal gas spent on pubdata is around 120kb * 2^20 gas/byte = ~120 * 10^9 gas.
+
+        // In this test we will set gas per pubdata byte to its maximum value, while publishing a large L1->L2 message.
+
+        const minimalL2GasPrice = ethers.BigNumber.from(process.env.CHAIN_STATE_KEEPER_MINIMAL_L2_GAS_PRICE!);
+
+        // We want the total gas limit to be over u32::MAX, so we need the gas per pubdata to be 50k.
+        //
+        // Note, that in case, any sort of overhead is present in the l2 fair gas price calculation, the final
+        // gas per pubdata may be lower than 50_000. Here we assume that it is not the case, but we'll double check
+        // that the gasLimit is indeed over u32::MAX, which is the most important tested property.
+        const requiredPubdataPrice = minimalL2GasPrice.mul(100_000);
+
+        await setInternalL1GasPrice(
+            alice._providerL2(),
+            requiredPubdataPrice.toString(),
+            requiredPubdataPrice.toString()
+        );
+
+        const l1Messenger = new ethers.Contract(zksync.utils.L1_MESSENGER_ADDRESS, zksync.utils.L1_MESSENGER, alice);
+
+        // Firstly, let's test a successful transaction.
+        const largeData = ethers.utils.randomBytes(90_000);
+        const tx = await l1Messenger.sendToL1(largeData);
+        expect(tx.gasLimit.gt(UINT32_MAX)).toBeTruthy();
+        const receipt = await tx.wait();
+        expect(receipt.gasUsed.gt(UINT32_MAX)).toBeTruthy();
+
+        // Secondly, let's test an unsuccessful transaction with large refund.
+
+        // The size of the data has increased, so the previous gas limit is not enough.
+        const largerData = ethers.utils.randomBytes(91_000);
+        const gasToPass = receipt.gasUsed;
+        const unsuccessfulTx = await l1Messenger.sendToL1(largerData, {
+            gasLimit: gasToPass
+        });
+
+        try {
+            await unsuccessfulTx.wait();
+            throw new Error('The transaction should have reverted');
+        } catch {
+            const receipt = await alice.provider.getTransactionReceipt(unsuccessfulTx.hash);
+            expect(gasToPass.sub(receipt.gasUsed).gt(UINT32_MAX)).toBeTruthy();
+        }
+    });
+
     afterAll(async () => {
+        // Returning the pubdata price to the default one
+        await setInternalL1GasPrice(alice._providerL2(), undefined, undefined, true);
+
         await testMaster.deinitialize();
     });
 });
@@ -114,7 +201,8 @@ async function appendResults(
     newL1GasPrice: number,
     reports: string[]
 ): Promise<string[]> {
-    await setInternalL1GasPrice(sender._providerL2(), newL1GasPrice.toString());
+    // For the sake of simplicity, we'll use the same pubdata price as the L1 gas price.
+    await setInternalL1GasPrice(sender._providerL2(), newL1GasPrice.toString(), newL1GasPrice.toString());
 
     if (originalL1Receipts.length !== reports.length && originalL1Receipts.length !== transactionRequests.length) {
         throw new Error('The array of receipts and reports have different length');
@@ -147,7 +235,9 @@ async function updateReport(
     const estimatedPrice = estimatedL2GasPrice.mul(estimatedL2GasLimit);
 
     const balanceBefore = await sender.getBalance();
-    await (await sender.sendTransaction(transactionRequest)).wait();
+    const transaction = await sender.sendTransaction(transactionRequest);
+    console.log(`Sending transaction: ${transaction.hash}`);
+    await transaction.wait();
     const balanceAfter = await sender.getBalance();
     const balanceDiff = balanceBefore.sub(balanceAfter);
 
@@ -172,7 +262,7 @@ async function killServerAndWaitForShutdown(provider: zksync.Provider) {
     while (iter < 30) {
         try {
             await provider.getBlockNumber();
-            await utils.sleep(5);
+            await utils.sleep(2);
             iter += 1;
         } catch (_) {
             // When exception happens, we assume that server died.
@@ -183,19 +273,37 @@ async function killServerAndWaitForShutdown(provider: zksync.Provider) {
     throw new Error("Server didn't stop after a kill request");
 }
 
-async function setInternalL1GasPrice(provider: zksync.Provider, newPrice?: string, disconnect?: boolean) {
+async function setInternalL1GasPrice(
+    provider: zksync.Provider,
+    newL1GasPrice?: string,
+    newPubdataPrice?: string,
+    disconnect?: boolean
+) {
     // Make sure server isn't running.
     try {
         await killServerAndWaitForShutdown(provider);
     } catch (_) {}
 
     // Run server in background.
-    let command = 'zk server --components api,tree,eth,data_fetcher,state_keeper';
+    let command = 'zk server --components api,tree,eth,state_keeper';
     command = `DATABASE_MERKLE_TREE_MODE=full ${command}`;
-    if (newPrice) {
-        command = `ETH_SENDER_GAS_ADJUSTER_INTERNAL_ENFORCED_L1_GAS_PRICE=${newPrice} ${command}`;
+
+    if (newPubdataPrice) {
+        command = `ETH_SENDER_GAS_ADJUSTER_INTERNAL_ENFORCED_PUBDATA_PRICE=${newPubdataPrice} ${command}`;
     }
-    const zkSyncServer = utils.background(command, 'ignore');
+
+    if (newL1GasPrice) {
+        // We need to ensure that each transaction gets into its own batch for more fair comparison.
+        command = `ETH_SENDER_GAS_ADJUSTER_INTERNAL_ENFORCED_L1_GAS_PRICE=${newL1GasPrice}  ${command}`;
+    }
+
+    const testMode = newPubdataPrice || newL1GasPrice;
+    if (testMode) {
+        // We need to ensure that each transaction gets into its own batch for more fair comparison.
+        command = `CHAIN_STATE_KEEPER_TRANSACTION_SLOTS=1 ${command}`;
+    }
+
+    const zkSyncServer = utils.background(command, [null, logs, logs]);
 
     if (disconnect) {
         zkSyncServer.unref();
@@ -208,11 +316,13 @@ async function setInternalL1GasPrice(provider: zksync.Provider, newPrice?: strin
         try {
             mainContract = await provider.getMainContractAddress();
         } catch (_) {
-            await utils.sleep(5);
+            await utils.sleep(2);
             iter += 1;
         }
     }
     if (!mainContract) {
         throw new Error('Server did not start');
     }
+
+    await utils.sleep(10);
 }

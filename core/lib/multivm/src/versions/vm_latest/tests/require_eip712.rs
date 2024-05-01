@@ -2,7 +2,7 @@ use std::convert::TryInto;
 
 use ethabi::Token;
 use zksync_eth_signer::{raw_ethereum_tx::TransactionParameters, EthereumSigner};
-use zksync_system_constants::L2_ETH_TOKEN_ADDRESS;
+use zksync_system_constants::L2_BASE_TOKEN_ADDRESS;
 use zksync_types::{
     fee::Fee, l2::L2Tx, transaction_request::TransactionRequest,
     utils::storage_key_for_standard_token_balance, AccountTreeId, Address, Eip712Domain, Execute,
@@ -23,7 +23,7 @@ use crate::{
 impl VmTester<HistoryDisabled> {
     pub(crate) fn get_eth_balance(&mut self, address: Address) -> U256 {
         let key = storage_key_for_standard_token_balance(
-            AccountTreeId::new(L2_ETH_TOKEN_ADDRESS),
+            AccountTreeId::new(L2_BASE_TOKEN_ADDRESS),
             &address,
         );
         self.vm.state.storage.storage.read_from_storage(&key)
@@ -37,8 +37,8 @@ impl VmTester<HistoryDisabled> {
 /// Currently we support both, but in the future, we should allow only EIP712 transactions to access the AA accounts.
 async fn test_require_eip712() {
     // Use 3 accounts:
-    // - private_address - EOA account, where we have the key
-    // - account_address - AA account, where the contract is deployed
+    // - `private_address` - EOA account, where we have the key
+    // - `account_address` - AA account, where the contract is deployed
     // - beneficiary - an EOA account, where we'll try to transfer the tokens.
     let account_abstraction = Account::random();
     let mut private_account = Account::random();
@@ -56,8 +56,8 @@ async fn test_require_eip712() {
 
     let chain_id: u32 = 270;
 
-    // First, let's set the owners of the AA account to the private_address.
-    // (so that messages signed by private_address, are authorized to act on behalf of the AA account).
+    // First, let's set the owners of the AA account to the `private_address`.
+    // (so that messages signed by `private_address`, are authorized to act on behalf of the AA account).
     let set_owners_function = contract.function("setOwners").unwrap();
     let encoded_input = set_owners_function
         .encode_input(&[Token::Array(vec![Token::Address(private_account.address)])])
@@ -93,6 +93,8 @@ async fn test_require_eip712() {
         access_list: None,
         max_fee_per_gas: U256::from(1000000000),
         max_priority_fee_per_gas: U256::from(1000000000),
+        max_fee_per_blob_gas: None,
+        blob_versioned_hashes: None,
     };
 
     let aa_tx = private_account.sign_legacy_tx(aa_raw_tx).await;
@@ -107,6 +109,7 @@ async fn test_require_eip712() {
     vm.vm.push_transaction(transaction);
     let result = vm.vm.execute(VmExecutionMode::OneTx);
     assert!(!result.result.is_failed());
+
     assert_eq!(
         vm.get_eth_balance(beneficiary.address),
         U256::from(888000088)

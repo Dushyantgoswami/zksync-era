@@ -12,8 +12,8 @@ use crate::interface::{Halt, VmExecutionStatistics, VmRevertReason};
 /// Refunds produced for the user.
 #[derive(Debug, Clone, Default)]
 pub struct Refunds {
-    pub gas_refunded: u32,
-    pub operator_suggested_refund: u32,
+    pub gas_refunded: u64,
+    pub operator_suggested_refund: u64,
 }
 
 /// Events/storage logs/l2->l1 logs created within transaction execution.
@@ -101,6 +101,7 @@ impl VmExecutionResultAndLogs {
             cycles_used: self.statistics.cycles_used,
             computational_gas_used: self.statistics.computational_gas_used,
             pubdata_published: self.statistics.pubdata_published,
+            circuit_statistic: self.statistics.circuit_statistic,
         }
     }
 }

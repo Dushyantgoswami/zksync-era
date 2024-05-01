@@ -3,25 +3,66 @@
 use std::time::{Duration, Instant};
 
 use vise::{
-    Buckets, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Histogram, LatencyObserver, Metrics,
+    Buckets, DurationAsSecs, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Histogram, Info,
+    LatencyObserver, Metrics, Unit,
 };
+use zksync_config::configs::database::MerkleTreeMode;
+use zksync_shared_metrics::{BlockStage, APP_METRICS};
 use zksync_types::block::L1BatchHeader;
 use zksync_utils::time::seconds_since_epoch;
 
-use super::MetadataCalculator;
-use crate::metrics::{BlockStage, APP_METRICS};
+use super::{MetadataCalculator, MetadataCalculatorConfig};
+
+#[derive(Debug, EncodeLabelValue)]
+#[metrics(rename_all = "snake_case")]
+enum ModeLabel {
+    Full,
+    Lightweight,
+}
+
+impl From<MerkleTreeMode> for ModeLabel {
+    fn from(mode: MerkleTreeMode) -> Self {
+        match mode {
+            MerkleTreeMode::Full => Self::Full,
+            MerkleTreeMode::Lightweight => Self::Lightweight,
+        }
+    }
+}
+
+#[derive(Debug, EncodeLabelSet)]
+pub(super) struct ConfigLabels {
+    mode: ModeLabel,
+    #[metrics(unit = Unit::Seconds)]
+    delay_interval: DurationAsSecs,
+    max_l1_batches_per_iter: usize,
+    multi_get_chunk_size: usize,
+    #[metrics(unit = Unit::Bytes)]
+    block_cache_capacity: usize,
+    #[metrics(unit = Unit::Bytes)]
+    memtable_capacity: usize,
+    #[metrics(unit = Unit::Seconds)]
+    stalled_writes_timeout: DurationAsSecs,
+}
+
+impl ConfigLabels {
+    pub fn new(config: &MetadataCalculatorConfig) -> Self {
+        Self {
+            mode: config.mode.into(),
+            delay_interval: config.delay_interval.into(),
+            max_l1_batches_per_iter: config.max_l1_batches_per_iter,
+            multi_get_chunk_size: config.multi_get_chunk_size,
+            block_cache_capacity: config.block_cache_capacity,
+            memtable_capacity: config.memtable_capacity,
+            stalled_writes_timeout: config.stalled_writes_timeout.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
 #[metrics(label = "stage", rename_all = "snake_case")]
 pub(super) enum TreeUpdateStage {
     LoadChanges,
     Compute,
-    CheckConsistency,
-    EventsCommitment,
-    BootloaderCommitment,
-    BuildMetadata,
-    #[metrics(name = "reestimate_block_commit_gas_cost")]
-    ReestimateGasCost,
     SavePostgres,
     SaveRocksdb,
     SaveGcs,
@@ -85,6 +126,8 @@ const LATENCIES_PER_LOG: Buckets = Buckets::values(&[
 #[derive(Debug, Metrics)]
 #[metrics(prefix = "server_metadata_calculator")]
 pub(super) struct MetadataCalculatorMetrics {
+    /// Merkle tree configuration.
+    pub info: Info<ConfigLabels>,
     /// Lag between the number of L1 batches processed in the Merkle tree and stored in Postgres.
     /// The lag can only be positive if Postgres was restored from a backup truncating some
     /// of the batches already processed by the tree.
@@ -174,3 +217,38 @@ impl MetadataCalculator {
         APP_METRICS.block_latency[&BlockStage::Tree].observe(Duration::from_secs(latency));
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
+#[metrics(label = "stage", rename_all = "snake_case")]
+pub(super) enum RecoveryStage {
+    LoadChunkStarts,
+    Finalize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
+#[metrics(label = "stage", rename_all = "snake_case")]
+pub(super) enum ChunkRecoveryStage {
+    AcquireConnection,
+    LoadEntries,
+    LockTree,
+    ExtendTree,
+}
+
+/// Metrics for Merkle tree recovery driven by the metadata calculator.
+#[derive(Debug, Metrics)]
+#[metrics(prefix = "server_metadata_calculator_recovery")]
+pub(super) struct MetadataCalculatorRecoveryMetrics {
+    /// Number of chunks recovered.
+    pub recovered_chunk_count: Gauge<u64>,
+    /// Latency of a tree recovery stage (not related to the recovery of a particular chunk;
+    /// those metrics are tracked in the `chunk_latency` histogram).
+    #[metrics(buckets = Buckets::LATENCIES, unit = Unit::Seconds)]
+    pub latency: Family<RecoveryStage, Histogram<Duration>>,
+    /// Latency of a chunk recovery stage.
+    #[metrics(buckets = Buckets::LATENCIES, unit = Unit::Seconds)]
+    pub chunk_latency: Family<ChunkRecoveryStage, Histogram<Duration>>,
+}
+
+#[vise::register]
+pub(super) static RECOVERY_METRICS: vise::Global<MetadataCalculatorRecoveryMetrics> =
+    vise::Global::new();

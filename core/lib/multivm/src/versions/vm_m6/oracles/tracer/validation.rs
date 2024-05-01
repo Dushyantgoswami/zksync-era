@@ -8,7 +8,7 @@ use zk_evm_1_3_1::{
 };
 use zksync_system_constants::{
     ACCOUNT_CODE_STORAGE_ADDRESS, BOOTLOADER_ADDRESS, CONTRACT_DEPLOYER_ADDRESS,
-    KECCAK256_PRECOMPILE_ADDRESS, L2_ETH_TOKEN_ADDRESS, MSG_VALUE_SIMULATOR_ADDRESS,
+    KECCAK256_PRECOMPILE_ADDRESS, L2_BASE_TOKEN_ADDRESS, MSG_VALUE_SIMULATOR_ADDRESS,
     SYSTEM_CONTEXT_ADDRESS,
 };
 use zksync_types::{
@@ -100,7 +100,7 @@ fn touches_allowed_context(address: Address, key: U256) -> bool {
         return false;
     }
 
-    // Only chain_id is allowed to be touched.
+    // Only `chain_id` is allowed to be touched.
     key == U256::from(0u32)
 }
 
@@ -122,7 +122,7 @@ fn valid_eth_token_call(address: Address, msg_sender: Address) -> bool {
     let is_valid_caller = msg_sender == MSG_VALUE_SIMULATOR_ADDRESS
         || msg_sender == CONTRACT_DEPLOYER_ADDRESS
         || msg_sender == BOOTLOADER_ADDRESS;
-    address == L2_ETH_TOKEN_ADDRESS && is_valid_caller
+    address == L2_BASE_TOKEN_ADDRESS && is_valid_caller
 }
 
 /// Tracer that is used to ensure that the validation adheres to all the rules
@@ -235,7 +235,7 @@ impl<S: Storage, H: HistoryMode> ValidationTracer<S, H> {
             return true;
         }
 
-        // The pair of MSG_VALUE_SIMULATOR_ADDRESS & L2_ETH_TOKEN_ADDRESS simulates the behavior of transferring ETH
+        // The pair of `MSG_VALUE_SIMULATOR_ADDRESS` & `L2_ETH_TOKEN_ADDRESS` simulates the behavior of transferring ETH
         // that is safe for the DDoS protection rules.
         if valid_eth_token_call(address, msg_sender) {
             return true;
@@ -279,20 +279,20 @@ impl<S: Storage, H: HistoryMode> ValidationTracer<S, H> {
         let (potential_address_bytes, potential_position_bytes) = calldata.split_at(32);
         let potential_address = be_bytes_to_safe_address(potential_address_bytes);
 
-        // If the validation_address is equal to the potential_address,
-        // then it is a request that could be used for mapping of kind mapping(address => ...).
+        // If the `validation_address` is equal to the `potential_address`,
+        // then it is a request that could be used for mapping of kind `mapping(address => ...)`.
         //
-        // If the potential_position_bytes were already allowed before, then this keccak might be used
-        // for ERC-20 allowance or any other of mapping(address => mapping(...))
+        // If the `potential_position_bytes` were already allowed before, then this keccak might be used
+        // for ERC-20 allowance or any other of `mapping(address => mapping(...))`
         if potential_address == Some(validated_address)
             || self
                 .auxilary_allowed_slots
                 .contains(&H256::from_slice(potential_position_bytes))
         {
-            // This is request that could be used for mapping of kind mapping(address => ...)
+            // This is request that could be used for mapping of kind `mapping(address => ...)`
 
             // We could theoretically wait for the slot number to be returned by the
-            // keccak256 precompile itself, but this would complicate the code even further
+            // `keccak256` precompile itself, but this would complicate the code even further
             // so let's calculate it here.
             let slot = keccak256(calldata);
 

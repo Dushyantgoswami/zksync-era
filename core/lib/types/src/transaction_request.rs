@@ -4,7 +4,7 @@ use rlp::{DecoderError, Rlp, RlpStream};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zksync_basic_types::H256;
-use zksync_system_constants::{MAX_GAS_PER_PUBDATA_BYTE, USED_BOOTLOADER_MEMORY_BYTES};
+use zksync_system_constants::{DEFAULT_L2_TX_GAS_PER_PUBDATA_BYTE, MAX_ENCODED_TX_SIZE};
 use zksync_utils::{
     bytecode::{hash_bytecode, validate_bytecode, InvalidBytecodeError},
     concat_and_hash, u256_to_h256,
@@ -50,6 +50,9 @@ pub struct CallRequest {
     /// Data (None for empty data)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Bytes>,
+    /// Input (None for empty)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Bytes>,
     /// Nonce
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<U256>,
@@ -123,6 +126,11 @@ impl CallRequestBuilder {
         self
     }
 
+    pub fn input(mut self, input: Bytes) -> Self {
+        self.call_request.input = Some(input);
+        self
+    }
+
     /// Set transaction type, Some(1) for AccessList transaction, None for Legacy
     pub fn transaction_type(mut self, transaction_type: U64) -> Self {
         self.call_request.transaction_type = Some(transaction_type);
@@ -182,7 +190,7 @@ pub enum SerializationTransactionError {
     /// OversizedData is returned if the raw tx size is greater
     /// than some meaningful limit a user might use. This is not a consensus error
     /// making the transaction invalid, rather a DOS protection.
-    #[error("oversized data. max: {0}; actual: {0}")]
+    #[error("oversized data. max: {0}; actual: {1}")]
     OversizedData(usize, usize),
     #[error("gas per pub data limit is zero")]
     GasPerPubDataLimitZero,
@@ -442,7 +450,7 @@ impl TransactionRequest {
         match self.transaction_type {
             // EIP-2930 (0x01)
             Some(x) if x == EIP_2930_TX_TYPE.into() => {
-                // rlp_opt(rlp, &self.chain_id);
+                // `rlp_opt(rlp, &self.chain_id);`
                 rlp.append(&chain_id);
                 rlp.append(&self.nonce);
                 rlp.append(&self.gas_price);
@@ -454,7 +462,7 @@ impl TransactionRequest {
             }
             // EIP-1559 (0x02)
             Some(x) if x == EIP_1559_TX_TYPE.into() => {
-                // rlp_opt(rlp, &self.chain_id);
+                // `rlp_opt(rlp, &self.chain_id);`
                 rlp.append(&chain_id);
                 rlp.append(&self.nonce);
                 rlp_opt(rlp, &self.max_priority_fee_per_gas);
@@ -743,8 +751,8 @@ impl TransactionRequest {
             }
             meta.gas_per_pubdata
         } else {
-            // For transactions that don't support corresponding field, a default is chosen.
-            U256::from(MAX_GAS_PER_PUBDATA_BYTE)
+            // For transactions that don't support corresponding field, a maximal default value is chosen.
+            DEFAULT_L2_TX_GAS_PER_PUBDATA_BYTE.into()
         };
 
         let max_priority_fee_per_gas = self.max_priority_fee_per_gas.unwrap_or(self.gas_price);
@@ -821,7 +829,7 @@ impl L2Tx {
 
     /// Ensures that encoded transaction size is not greater than `max_tx_size`.
     fn check_encoded_size(&self, max_tx_size: usize) -> Result<(), SerializationTransactionError> {
-        // since abi_encoding_len returns 32-byte words multiplication on 32 is needed
+        // since `abi_encoding_len` returns 32-byte words multiplication on 32 is needed
         let tx_size = self.abi_encoding_len() * 32;
         if tx_size > max_tx_size {
             return Err(SerializationTransactionError::OversizedData(
@@ -869,7 +877,7 @@ impl From<CallRequest> for TransactionRequest {
             value: call_request.value.unwrap_or_default(),
             gas_price: call_request.gas_price.unwrap_or_default(),
             gas: call_request.gas.unwrap_or_default(),
-            input: call_request.data.unwrap_or_default(),
+            input: call_request.input.or(call_request.data).unwrap_or_default(),
             transaction_type: call_request.transaction_type,
             access_list: call_request.access_list,
             eip712_meta: call_request.eip712_meta,
@@ -882,7 +890,7 @@ impl TryFrom<CallRequest> for L1Tx {
     type Error = SerializationTransactionError;
     fn try_from(tx: CallRequest) -> Result<Self, Self::Error> {
         // L1 transactions have no limitations on the transaction size.
-        let tx: L2Tx = L2Tx::from_request(tx.into(), USED_BOOTLOADER_MEMORY_BYTES)?;
+        let tx: L2Tx = L2Tx::from_request(tx.into(), MAX_ENCODED_TX_SIZE)?;
 
         // Note, that while the user has theoretically provided the fee for ETH on L1,
         // the payment to the operator as well as refunds happen on L2 and so all the ETH
@@ -890,7 +898,7 @@ impl TryFrom<CallRequest> for L1Tx {
         let total_needed_eth =
             tx.execute.value + tx.common_data.fee.max_fee_per_gas * tx.common_data.fee.gas_limit;
 
-        // Note, that we do not set refund_recipient here, to keep it explicitly 0,
+        // Note, that we do not set `refund_recipient` here, to keep it explicitly 0,
         // so that during fee estimation it is taken into account that the refund recipient may be a different address
         let common_data = L1TxCommonData {
             sender: tx.common_data.initiator_address,
@@ -945,7 +953,7 @@ pub fn validate_factory_deps(
 
 #[cfg(test)]
 mod tests {
-    use secp256k1::SecretKey;
+    use zksync_crypto_primitives::K256PrivateKey;
 
     use super::*;
     use crate::web3::{
@@ -958,10 +966,12 @@ mod tests {
     async fn decode_real_tx() {
         let accounts = crate::web3::api::Accounts::new(TestTransport::default());
 
-        let pk = hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
-            .unwrap();
-        let address = PackedEthSignature::address_from_private_key(&H256::from_slice(&pk)).unwrap();
-        let key = SecretKey::from_slice(&pk).unwrap();
+        let private_key_bytes: H256 =
+            "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+                .parse()
+                .unwrap();
+        let private_key = K256PrivateKey::from_bytes(private_key_bytes).unwrap();
+        let address = private_key.address();
 
         let tx = TransactionParameters {
             nonce: Some(U256::from(1u32)),
@@ -976,7 +986,10 @@ mod tests {
             transaction_type: None,
             access_list: None,
         };
-        let signed_tx = accounts.sign_transaction(tx.clone(), &key).await.unwrap();
+        let signed_tx = accounts
+            .sign_transaction(tx.clone(), private_key.expose_secret())
+            .await
+            .unwrap();
         let (tx2, _) = TransactionRequest::from_bytes(
             signed_tx.raw_transaction.0.as_slice(),
             L2ChainId::from(270),
@@ -992,8 +1005,8 @@ mod tests {
 
     #[test]
     fn decode_rlp() {
-        let private_key = H256::random();
-        let address = PackedEthSignature::address_from_private_key(&private_key).unwrap();
+        let private_key = K256PrivateKey::random();
+        let address = private_key.address();
 
         let mut tx = TransactionRequest {
             nonce: U256::from(1u32),
@@ -1028,8 +1041,8 @@ mod tests {
 
     #[test]
     fn decode_eip712_with_meta() {
-        let private_key = H256::random();
-        let address = PackedEthSignature::address_from_private_key(&private_key).unwrap();
+        let private_key = K256PrivateKey::random();
+        let address = private_key.address();
 
         let mut tx = TransactionRequest {
             nonce: U256::from(1u32),
@@ -1076,8 +1089,8 @@ mod tests {
 
     #[test]
     fn check_recovered_public_key_eip712() {
-        let private_key = H256::random();
-        let address = PackedEthSignature::address_from_private_key(&private_key).unwrap();
+        let private_key = K256PrivateKey::random();
+        let address = private_key.address();
 
         let transaction_request = TransactionRequest {
             nonce: U256::from(1u32),
@@ -1113,8 +1126,8 @@ mod tests {
 
     #[test]
     fn check_recovered_public_key_eip712_with_wrong_chain_id() {
-        let private_key = H256::random();
-        let address = PackedEthSignature::address_from_private_key(&private_key).unwrap();
+        let private_key = K256PrivateKey::random();
+        let address = private_key.address();
 
         let transaction_request = TransactionRequest {
             nonce: U256::from(1u32),
@@ -1155,8 +1168,8 @@ mod tests {
 
     #[test]
     fn check_recovered_public_key_eip1559() {
-        let private_key = H256::random();
-        let address = PackedEthSignature::address_from_private_key(&private_key).unwrap();
+        let private_key = K256PrivateKey::random();
+        let address = private_key.address();
 
         let mut transaction_request = TransactionRequest {
             max_priority_fee_per_gas: Some(U256::from(1u32)),
@@ -1194,8 +1207,8 @@ mod tests {
 
     #[test]
     fn check_recovered_public_key_eip1559_with_wrong_chain_id() {
-        let private_key = H256::random();
-        let address = PackedEthSignature::address_from_private_key(&private_key).unwrap();
+        let private_key = K256PrivateKey::random();
+        let address = private_key.address();
 
         let mut transaction_request = TransactionRequest {
             max_priority_fee_per_gas: Some(U256::from(1u32)),
@@ -1233,8 +1246,8 @@ mod tests {
 
     #[test]
     fn check_decode_eip1559_with_access_list() {
-        let private_key = H256::random();
-        let address = PackedEthSignature::address_from_private_key(&private_key).unwrap();
+        let private_key = K256PrivateKey::random();
+        let address = private_key.address();
 
         let mut transaction_request = TransactionRequest {
             max_priority_fee_per_gas: Some(U256::from(1u32)),
@@ -1273,8 +1286,8 @@ mod tests {
 
     #[test]
     fn check_failed_to_decode_eip2930() {
-        let private_key = H256::random();
-        let address = PackedEthSignature::address_from_private_key(&private_key).unwrap();
+        let private_key = K256PrivateKey::random();
+        let address = private_key.address();
 
         let mut transaction_request = TransactionRequest {
             transaction_type: Some(EIP_2930_TX_TYPE.into()),
@@ -1394,9 +1407,10 @@ mod tests {
     #[test]
     fn transaction_request_with_oversize_data() {
         let random_tx_max_size = 1_000_000; // bytes
-        let private_key = H256::random();
-        let address = PackedEthSignature::address_from_private_key(&private_key).unwrap();
-        // choose some number that devides on 8 and is > 1_000_000
+        let private_key = K256PrivateKey::random();
+        let address = private_key.address();
+
+        // Choose some number that divides on 8 and is `> 1_000_000`
         let factory_dep = vec![2u8; 1600000];
         let factory_deps: Vec<Vec<u8>> = factory_dep.chunks(32).map(|s| s.into()).collect();
         let mut tx = TransactionRequest {
@@ -1457,6 +1471,7 @@ mod tests {
             max_priority_fee_per_gas: Some(U256::from(12u32)),
             value: Some(U256::from(12u32)),
             data: Some(Bytes(factory_dep)),
+            input: None,
             nonce: None,
             transaction_type: Some(U64::from(EIP_712_TX_TYPE)),
             access_list: None,
@@ -1483,26 +1498,42 @@ mod tests {
             max_priority_fee_per_gas: Some(U256::from(12u32)),
             value: Some(U256::from(12u32)),
             data: Some(Bytes(vec![1, 2, 3])),
+            input: None,
             nonce: Some(U256::from(123u32)),
             transaction_type: Some(U64::from(EIP_712_TX_TYPE)),
             access_list: None,
             eip712_meta: None,
         };
-        let l2_tx = L2Tx::from_request(
-            call_request_with_nonce.clone().into(),
-            USED_BOOTLOADER_MEMORY_BYTES,
-        )
-        .unwrap();
+        let l2_tx = L2Tx::from_request(call_request_with_nonce.clone().into(), MAX_ENCODED_TX_SIZE)
+            .unwrap();
         assert_eq!(l2_tx.nonce(), Nonce(123u32));
 
         let mut call_request_without_nonce = call_request_with_nonce;
         call_request_without_nonce.nonce = None;
 
-        let l2_tx = L2Tx::from_request(
-            call_request_without_nonce.into(),
-            USED_BOOTLOADER_MEMORY_BYTES,
-        )
-        .unwrap();
+        let l2_tx =
+            L2Tx::from_request(call_request_without_nonce.into(), MAX_ENCODED_TX_SIZE).unwrap();
         assert_eq!(l2_tx.nonce(), Nonce(0u32));
+    }
+
+    #[test]
+    fn test_correct_data_field() {
+        let mut call_request = CallRequest {
+            input: Some(Bytes(vec![1, 2, 3])),
+            data: Some(Bytes(vec![3, 2, 1])),
+            ..Default::default()
+        };
+
+        let tx_request = TransactionRequest::from(call_request.clone());
+        assert_eq!(tx_request.input, call_request.input.unwrap());
+
+        call_request.input = None;
+        let tx_request = TransactionRequest::from(call_request.clone());
+        assert_eq!(tx_request.input, call_request.data.unwrap());
+
+        call_request.input = Some(Bytes(vec![1, 2, 3]));
+        call_request.data = None;
+        let tx_request = TransactionRequest::from(call_request.clone());
+        assert_eq!(tx_request.input, call_request.input.unwrap());
     }
 }

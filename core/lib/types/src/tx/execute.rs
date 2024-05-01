@@ -5,7 +5,7 @@ use zksync_utils::ZeroPrefixHexSerde;
 use crate::{web3::ethabi, Address, EIP712TypedStructure, StructBuilder, H256, U256};
 
 /// `Execute` transaction executes a previously deployed smart contract in the L2 rollup.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Execute {
     pub contract_address: Address,
@@ -22,6 +22,21 @@ pub struct Execute {
     pub factory_deps: Option<Vec<Vec<u8>>>,
 }
 
+impl std::fmt::Debug for Execute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let factory_deps = match &self.factory_deps {
+            Some(deps) => format!("Some(<{} factory deps>)", deps.len()),
+            None => "None".to_string(),
+        };
+        f.debug_struct("Execute")
+            .field("contract_address", &self.contract_address)
+            .field("calldata", &hex::encode(&self.calldata))
+            .field("value", &self.value)
+            .field("factory_deps", &factory_deps)
+            .finish()
+    }
+}
+
 impl EIP712TypedStructure for Execute {
     const TYPE_NAME: &'static str = "Transaction";
 
@@ -31,7 +46,7 @@ impl EIP712TypedStructure for Execute {
         builder.add_member("data", &self.calldata.as_slice());
         // Factory deps are not included into the transaction signature, since they are parsed from the
         // transaction metadata.
-        // Note that for the deploy transactions all the dependencies are implicitly included into the "calldataHash"
+        // Note that for the deploy transactions all the dependencies are implicitly included into the `calldataHash`
         // field, because the deps are referenced in the bytecode of the "main" contract bytecode.
     }
 }

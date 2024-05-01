@@ -2,8 +2,9 @@ use std::{convert::TryFrom, str::FromStr};
 
 use sqlx::types::chrono::{DateTime, NaiveDateTime, NaiveTime, Utc};
 use zksync_types::{
-    proofs::{
-        AggregationRound, JobPosition, WitnessJobInfo, WitnessJobStatus, WitnessJobStatusFailed,
+    basic_fri_types::AggregationRound,
+    prover_dal::{
+        JobPosition, WitnessJobInfo, WitnessJobStatus, WitnessJobStatusFailed,
         WitnessJobStatusSuccessful,
     },
     L1BatchNumber,

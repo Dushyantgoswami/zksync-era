@@ -1,7 +1,9 @@
+mod aggregated_operations;
 mod aggregator;
 mod error;
 mod eth_tx_aggregator;
 mod eth_tx_manager;
+pub mod l1_batch_commit_data_generator;
 mod metrics;
 mod publish_criterion;
 mod zksync_functions;

@@ -1,6 +1,6 @@
 # Running the application
 
-This document covers common scenarios of launching zkSync applications set locally.
+This document covers common scenarios for launching zkSync applications set locally.
 
 ## Prerequisites
 
@@ -17,8 +17,9 @@ zk # installs and builds zk itself
 zk init
 ```
 
-If you face any other problems with the `zk init` command, go to the [Troubleshooting](#Troubleshooting) section at the
-end of this file. There are solutions for some common error cases.
+If you face any other problems with the `zk init` command, go to the
+[Troubleshooting](https://github.com/matter-labs/zksync-era/blob/main/docs/guides/launch.md#troubleshooting) section at
+the end of this file. There are solutions for some common error cases.
 
 To completely reset the dev environment:
 
@@ -37,6 +38,22 @@ launch:
 zk up
 ```
 
+### Run observability stack
+
+If you want to run [Dockprom](https://github.com/stefanprodan/dockprom/) stack (Prometheus, Grafana) alongside other
+containers - add `--run-observability` parameter during initialisation.
+
+```
+zk init --run-observability
+```
+
+That will also provision Grafana with
+[era-observability](https://github.com/matter-labs/era-observability/tree/main/dashboards) dashboards. You can then
+access it at `http://127.0.0.1:3000/` under credentials `admin/admin`.
+
+> If you don't see any data displayed on the Grafana dashboards - try setting the timeframe to "Last 30 minutes". You
+> will also have to have `jq` installed on your system.
+
 ## (Re)deploy db and contracts
 
 ```
@@ -45,7 +62,7 @@ zk contract redeploy
 
 ## Environment configurations
 
-Env config files are held in `etc/env/`
+Env config files are held in `etc/env/target/`
 
 List configurations:
 
@@ -71,7 +88,8 @@ zk server
 ```
 
 Server is configured using env files in `./etc/env` directory. After the first initialization, file
-`./etc/env/dev.env`will be created. By default, this file is copied from the `./etc/env/dev.env.example` template.
+`./etc/env/target/dev.env`will be created. By default, this file is copied from the `./etc/env/target/dev.env.example`
+template.
 
 Make sure you have environment variables set right, you can check it by running: `zk env`. You should see `* dev` in
 output.
@@ -109,29 +127,6 @@ zk f cargo +nightly run --features gpu --release --bin zksync_prover
 cargo run --release --bin zksync_verification_key_generator
 
 
-```
-
-## Running the setup key generator on machine with GPU
-
-- uncomment `"core/bin/setup_key_generator_and_server",` from root `Cargo.toml` file.
-- ensure that the setup_2^26.key in the current directory, the file can be downloaded from
-  <https://universal-setup.ams3.digitaloceanspaces.com/setup_2^26.key>
-
-```shell
-export BELLMAN_CUDA_DIR=$PWD
-# To generate setup key for specific circuit type[0 - 17], 2 below corresponds to circuit type 2.
-cargo +nightly run --features gpu --release --bin zksync_setup_key_generator -- --numeric-circuit 2
-```
-
-## Running the setup key generator on machine without GPU
-
-- uncomment `"core/bin/setup_key_generator_and_server",` from root `Cargo.toml` file.
-- ensure that the setup_2^26.key in the current directory, the file can be downloaded from
-  <https://universal-setup.ams3.digitaloceanspaces.com/setup_2^26.key>
-
-```shell
-# To generate setup key for specific circuit type[0 - 17], 2 below corresponds to circuit type 2.
-cargo +nightly run --release --bin zksync_setup_key_generator -- --numeric-circuit 2
 ```
 
 ## Generating binary verification keys for existing json verification keys

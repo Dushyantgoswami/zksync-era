@@ -1,4 +1,4 @@
-use zk_evm_1_4_0::{
+use zk_evm_1_5_0::{
     tracing::{AfterExecutionData, VmLocalStateData},
     zkevm_opcode_defs::{
         FarCallABI, FatPointer, Opcode, RetOpcode, CALL_IMPLICIT_CALLDATA_FAT_PTR_REGISTER,
@@ -9,12 +9,14 @@ use zksync_state::{StoragePtr, WriteStorage};
 use zksync_system_constants::CONTRACT_DEPLOYER_ADDRESS;
 use zksync_types::{
     vm_trace::{Call, CallType},
-    FarCallOpcode, U256,
+    zk_evm_types::FarCallOpcode,
+    U256,
 };
 
 use crate::{
+    glue::GlueInto,
     interface::{
-        tracer::VmExecutionStopReason, traits::tracers::dyn_tracers::vm_1_4_0::DynTracer,
+        tracer::VmExecutionStopReason, traits::tracers::dyn_tracers::vm_1_5_0::DynTracer,
         VmRevertReason,
     },
     tracers::call_tracer::CallTracer,
@@ -42,10 +44,10 @@ impl<S, H: HistoryMode> DynTracer<S, SimpleMemory<H>> for CallTracer {
                     .inner
                     .last()
                     .map(|call| call.ergs_remaining + current_ergs)
-                    .unwrap_or(current_ergs);
+                    .unwrap_or(current_ergs) as u64;
 
                 let mut current_call = Call {
-                    r#type: CallType::Call(far_call),
+                    r#type: CallType::Call(far_call.glue_into()),
                     gas: 0,
                     parent_gas,
                     ..Default::default()
@@ -126,7 +128,7 @@ impl CallTracer {
         current_call.from = current.msg_sender;
         current_call.to = current.this_address;
         current_call.value = U256::from(current.context_u128_value);
-        current_call.gas = current.ergs_remaining;
+        current_call.gas = current.ergs_remaining as u64;
     }
 
     fn save_output_latest<H: HistoryMode>(
@@ -139,7 +141,7 @@ impl CallTracer {
         let fat_data_pointer =
             state.vm_local_state.registers[RET_IMPLICIT_RETURNDATA_PARAMS_REGISTER as usize];
 
-        // if fat_data_pointer is not a pointer then there is no output
+        // if `fat_data_pointer` is not a pointer then there is no output
         let output = if fat_data_pointer.is_pointer {
             let fat_data_pointer = FatPointer::from_u256(fat_data_pointer.value);
             if !fat_data_pointer.is_trivial() {
@@ -192,7 +194,7 @@ impl CallTracer {
         current_call.farcall.gas_used = current_call
             .farcall
             .parent_gas
-            .saturating_sub(state.vm_local_state.callstack.current.ergs_remaining);
+            .saturating_sub(state.vm_local_state.callstack.current.ergs_remaining as u64);
 
         self.save_output_latest(state, memory, ret_opcode, &mut current_call.farcall);
 

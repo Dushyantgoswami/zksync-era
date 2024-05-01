@@ -106,15 +106,16 @@ These precompiles simulate the behaviour of the EVM's EcAdd and EcMul precompile
 without circuit counterparts. You can read more about them
 [here](https://github.com/code-423n4/2023-10-zksync/blob/main/docs/Smart%20contract%20Section/Elliptic%20curve%20precompiles.md).
 
-## L2EthToken & MsgValueSimulator
+## L2BaseToken & MsgValueSimulator
 
 Unlike Ethereum, zkEVM does not have any notion of any special native token. That’s why we have to simulate operations
-with Ether via two contracts: `L2EthToken` & `MsgValueSimulator`.
+with Ether via two contracts: `L2BaseToken` & `MsgValueSimulator`.
 
-`L2EthToken` is a contract that holds the balances of ETH for the users. This contract does NOT provide ERC20 interface.
-The only method for transferring Ether is `transferFromTo`. It permits only some system contracts to transfer on behalf
-of users. This is needed to ensure that the interface is as close to Ethereum as possible, i.e. the only way to transfer
-ETH is by doing a call to a contract with some `msg.value`. This is what `MsgValueSimulator` system contract is for.
+`L2BaseToken` is a contract that holds the balances of ETH for the users. This contract does NOT provide ERC20
+interface. The only method for transferring Ether is `transferFromTo`. It permits only some system contracts to transfer
+on behalf of users. This is needed to ensure that the interface is as close to Ethereum as possible, i.e. the only way
+to transfer ETH is by doing a call to a contract with some `msg.value`. This is what `MsgValueSimulator` system contract
+is for.
 
 Whenever anyone wants to do a non-zero value call, they need to call `MsgValueSimulator` with:
 
@@ -122,7 +123,8 @@ Whenever anyone wants to do a non-zero value call, they need to call `MsgValueSi
 - Pass `value` and whether the call should be marked with `isSystem` in the first extra abi params.
 - Pass the address of the callee in the second extraAbiParam.
 
-More information on the extraAbiParams can be read [here](#flags-for-calls).
+More information on the extraAbiParams can be read
+[here](../../guides/advanced/0_alternative_vm_intro.md#flags-for-calls).
 
 ## KnownCodeStorage
 
@@ -145,7 +147,7 @@ It is the responsibility of the [ContractDeployer](#contractdeployer--immutables
 those code hashes that are known.
 
 The KnownCodesStorage contract is also responsible for ensuring that all the “known” bytecode hashes are also
-[valid](#bytecode-validity).
+[valid](../../guides/advanced/0_alternative_vm_intro.md#bytecode-validity).
 
 ## ContractDeployer & ImmutableSimulator
 
@@ -204,7 +206,8 @@ On Ethereum, the constructor is only part of the initCode that gets executed dur
 returns the deployment code of the contract. On zkSync, there is no separation between deployed code and constructor
 code. The constructor is always a part of the deployment code of the contract. In order to protect it from being called,
 the compiler-generated contracts invoke constructor only if the `isConstructor` flag provided (it is only available for
-the system contracts). You can read more about flags [here](#flags-for-calls).
+the system contracts). You can read more about flags
+[here](../../guides/advanced/0_alternative_vm_intro.md#flags-for-calls).
 
 After execution, the constructor must return an array of:
 
@@ -226,7 +229,8 @@ address.
 
 Whenever a contract needs to access a value of some immutable, they call the
 `ImmutableSimulator.getImmutable(getCodeAddress(), index)`. Note that on zkSync it is possible to get the current
-execution address (you can read more about `getCodeAddress()` [here](#zksync-specific-opcodes).
+execution address you can read more about `getCodeAddress()`
+[here](https://github.com/matter-labs/zksync-era/blob/main/docs/guides/advanced/0_alternative_vm_intro.md#zkevm-specific-opcodes).
 
 ### **Return value of the deployment methods**
 

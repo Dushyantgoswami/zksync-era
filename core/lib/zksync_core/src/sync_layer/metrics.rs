@@ -2,17 +2,21 @@
 
 use std::time::Duration;
 
-use vise::{Buckets, Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Histogram, Metrics};
+use vise::{Buckets, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Histogram, Metrics};
+use zksync_types::aggregated_operations::AggregatedActionType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
 #[metrics(label = "stage", rename_all = "snake_case")]
 pub(super) enum FetchStage {
-    GetMiniblockRange,
+    // uses legacy naming for L2 blocks for compatibility reasons
+    #[metrics(name = "get_miniblock_range")]
+    GetL2BlockRange,
     GetBlockDetails,
-    SyncL2Block,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, EncodeLabelValue, EncodeLabelSet,
+)]
 #[metrics(label = "stage", rename_all = "snake_case")]
 pub(super) enum L1BatchStage {
     Open,
@@ -21,10 +25,14 @@ pub(super) enum L1BatchStage {
     Executed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
-#[metrics(label = "method", rename_all = "snake_case")]
-pub(super) enum CachedMethod {
-    SyncL2Block,
+impl From<AggregatedActionType> for L1BatchStage {
+    fn from(ty: AggregatedActionType) -> Self {
+        match ty {
+            AggregatedActionType::Commit => Self::Committed,
+            AggregatedActionType::PublishProofOnchain => Self::Proven,
+            AggregatedActionType::Execute => Self::Executed,
+        }
+    }
 }
 
 /// Metrics for the fetcher.
@@ -34,16 +42,8 @@ pub(super) struct FetcherMetrics {
     #[metrics(buckets = Buckets::LATENCIES)]
     pub requests: Family<FetchStage, Histogram<Duration>>,
     pub l1_batch: Family<L1BatchStage, Gauge<u64>>,
+    // uses legacy naming for L2 blocks for compatibility reasons
     pub miniblock: Gauge<u64>,
-    #[metrics(buckets = Buckets::LATENCIES)]
-    pub fetch_next_miniblock: Histogram<Duration>,
-
-    // Cache-related metrics.
-    pub cache_total: Family<CachedMethod, Counter>,
-    pub cache_hit: Family<CachedMethod, Counter>,
-    pub cache_errors: Counter,
-    #[metrics(buckets = Buckets::LATENCIES)]
-    pub cache_populate: Histogram<Duration>,
 }
 
 #[vise::register]

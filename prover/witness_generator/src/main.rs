@@ -1,28 +1,28 @@
 #![feature(generic_const_exprs)]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
+use futures::{channel::mpsc, executor::block_on, SinkExt};
 use prometheus_exporter::PrometheusExporterConfig;
+use prover_dal::{ConnectionPool, Prover, ProverDal};
 use structopt::StructOpt;
 use tokio::sync::watch;
 use zksync_config::{
-    configs::{FriWitnessGeneratorConfig, PostgresConfig, PrometheusConfig},
+    configs::{FriWitnessGeneratorConfig, ObservabilityConfig, PostgresConfig, PrometheusConfig},
     ObjectStoreConfig,
 };
-use zksync_dal::ConnectionPool;
 use zksync_env_config::{object_store::ProverObjectStoreConfig, FromEnv};
 use zksync_object_store::ObjectStoreFactory;
-use zksync_prover_utils::get_stop_signal_receiver;
 use zksync_queued_job_processor::JobProcessor;
-use zksync_types::{proofs::AggregationRound, web3::futures::StreamExt};
-use zksync_utils::wait_for_tasks::wait_for_tasks;
+use zksync_types::{basic_fri_types::AggregationRound, web3::futures::StreamExt};
+use zksync_utils::wait_for_tasks::ManagedTasks;
 use zksync_vk_setup_data_server_fri::commitment_utils::get_cached_commitments;
 
 use crate::{
     basic_circuits::BasicWitnessGenerator, leaf_aggregation::LeafAggregationWitnessGenerator,
     metrics::SERVER_METRICS, node_aggregation::NodeAggregationWitnessGenerator,
-    scheduler::SchedulerWitnessGenerator,
+    recursion_tip::RecursionTipWitnessGenerator, scheduler::SchedulerWitnessGenerator,
 };
 
 mod basic_circuits;
@@ -30,9 +30,18 @@ mod leaf_aggregation;
 mod metrics;
 mod node_aggregation;
 mod precalculated_merkle_paths_provider;
+mod recursion_tip;
 mod scheduler;
 mod storage_oracle;
 mod utils;
+
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
+use zksync_dal::Core;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -55,24 +64,33 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    #[allow(deprecated)] // TODO (QIT-21): Use centralized configuration approach.
-    let log_format = vlog::log_format_from_env();
-    #[allow(deprecated)] // TODO (QIT-21): Use centralized configuration approach.
-    let sentry_url = vlog::sentry_url_from_env();
-    #[allow(deprecated)] // TODO (QIT-21): Use centralized configuration approach.
-    let environment = vlog::environment_from_env();
+    let observability_config =
+        ObservabilityConfig::from_env().context("ObservabilityConfig::from_env()")?;
+    let log_format: vlog::LogFormat = observability_config
+        .log_format
+        .parse()
+        .context("Invalid log format")?;
 
     let mut builder = vlog::ObservabilityBuilder::new().with_log_format(log_format);
-    if let Some(sentry_url) = &sentry_url {
+    if let Some(sentry_url) = &observability_config.sentry_url {
         builder = builder
             .with_sentry_url(sentry_url)
-            .context("Invalid Sentry URL")?
-            .with_sentry_environment(environment);
+            .expect("Invalid Sentry URL")
+            .with_sentry_environment(observability_config.sentry_environment);
+    }
+    if let Some(opentelemetry) = observability_config.opentelemetry {
+        builder = builder
+            .with_opentelemetry(
+                &opentelemetry.level,
+                opentelemetry.endpoint,
+                "zksync-witness-generator".into(),
+            )
+            .expect("Invalid OpenTelemetry config");
     }
     let _guard = builder.build();
 
     // Report whether sentry is running after the logging subsystem was initialized.
-    if let Some(sentry_url) = sentry_url {
+    if let Some(sentry_url) = observability_config.sentry_url {
         tracing::info!("Sentry configured with URL: {sentry_url}",);
     } else {
         tracing::info!("No sentry URL was provided");
@@ -89,32 +107,29 @@ async fn main() -> anyhow::Result<()> {
         FriWitnessGeneratorConfig::from_env().context("FriWitnessGeneratorConfig::from_env()")?;
     let prometheus_config = PrometheusConfig::from_env().context("PrometheusConfig::from_env()")?;
     let postgres_config = PostgresConfig::from_env().context("PostgresConfig::from_env()")?;
-    let connection_pool = ConnectionPool::builder(
+    let connection_pool = ConnectionPool::<Core>::builder(
         postgres_config.master_url()?,
         postgres_config.max_connections()?,
     )
     .build()
     .await
     .context("failed to build a connection_pool")?;
-    let prover_connection_pool = ConnectionPool::builder(
-        postgres_config.prover_url()?,
-        postgres_config.max_connections()?,
-    )
-    .build()
-    .await
-    .context("failed to build a prover_connection_pool")?;
+    let prover_connection_pool = ConnectionPool::<Prover>::singleton(postgres_config.prover_url()?)
+        .build()
+        .await
+        .context("failed to build a prover_connection_pool")?;
     let (stop_sender, stop_receiver) = watch::channel(false);
     let vk_commitments = get_cached_commitments();
     let protocol_versions = prover_connection_pool
-        .access_storage()
+        .connection()
         .await
         .unwrap()
         .fri_protocol_versions_dal()
         .protocol_version_for(&vk_commitments)
         .await;
 
-    // If batch_size is none, it means that the job is 'looping forever' (this is the usual setup in local network).
-    // At the same time, we're reading the protocol_version only once at startup - so if there is no protocol version
+    // If `batch_size` is none, it means that the job is 'looping forever' (this is the usual setup in local network).
+    // At the same time, we're reading the `protocol_version` only once at startup - so if there is no protocol version
     // read (this is often due to the fact, that the gateway was started too late, and it didn't put the updated protocol
     // versions into the database) - then the job will simply 'hang forever' and not pick any tasks.
     if opt.batch_size.is_none() && protocol_versions.is_empty() {
@@ -130,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
             AggregationRound::BasicCircuits,
             AggregationRound::LeafAggregation,
             AggregationRound::NodeAggregation,
+            AggregationRound::RecursionTip,
             AggregationRound::Scheduler,
         ],
         (Some(_), true) => {
@@ -160,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
                 prometheus_config.push_interval(),
             )
         } else {
-            // u16 cast is safe since i is in range [0, 4)
+            // `u16` cast is safe since i is in range [0, 4)
             PrometheusExporterConfig::pull(prometheus_config.listener_port + i as u16)
         };
         let prometheus_task = prometheus_config.run(stop_receiver.clone());
@@ -209,6 +225,16 @@ async fn main() -> anyhow::Result<()> {
                 .await;
                 generator.run(stop_receiver.clone(), opt.batch_size)
             }
+            AggregationRound::RecursionTip => {
+                let generator = RecursionTipWitnessGenerator::new(
+                    config.clone(),
+                    &store_factory,
+                    prover_connection_pool.clone(),
+                    protocol_versions.clone(),
+                )
+                .await;
+                generator.run(stop_receiver.clone(), opt.batch_size)
+            }
             AggregationRound::Scheduler => {
                 let generator = SchedulerWitnessGenerator::new(
                     config.clone(),
@@ -232,17 +258,21 @@ async fn main() -> anyhow::Result<()> {
         SERVER_METRICS.init_latency[&(*round).into()].set(started_at.elapsed());
     }
 
-    let mut stop_signal_receiver = get_stop_signal_receiver();
-    let graceful_shutdown = None::<futures::future::Ready<()>>;
-    let tasks_allowed_to_finish = true;
+    let (mut stop_signal_sender, mut stop_signal_receiver) = mpsc::channel(256);
+    ctrlc::set_handler(move || {
+        block_on(stop_signal_sender.send(true)).expect("Ctrl+C signal send");
+    })
+    .expect("Error setting Ctrl+C handler");
+    let mut tasks = ManagedTasks::new(tasks).allow_tasks_to_finish();
     tokio::select! {
-        _ = wait_for_tasks(tasks, None, graceful_shutdown, tasks_allowed_to_finish) => {},
+        _ = tasks.wait_single() => {},
         _ = stop_signal_receiver.next() => {
             tracing::info!("Stop signal received, shutting down");
         }
     }
 
-    stop_sender.send(true).ok();
+    stop_sender.send_replace(true);
+    tasks.complete(Duration::from_secs(5)).await;
     tracing::info!("Finished witness generation");
     Ok(())
 }

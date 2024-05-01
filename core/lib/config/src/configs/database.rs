@@ -23,9 +23,6 @@ pub struct MerkleTreeConfig {
     /// Path to the RocksDB data directory for Merkle tree.
     #[serde(default = "MerkleTreeConfig::default_path")]
     pub path: String,
-    /// Path to merkle tree backup directory.
-    #[serde(default = "MerkleTreeConfig::default_backup_path")]
-    pub backup_path: String,
     /// Operation mode for the Merkle tree. If not specified, the full mode will be used.
     #[serde(default)]
     pub mode: MerkleTreeMode,
@@ -53,7 +50,6 @@ impl Default for MerkleTreeConfig {
     fn default() -> Self {
         Self {
             path: Self::default_path(),
-            backup_path: Self::default_backup_path(),
             mode: MerkleTreeMode::default(),
             multi_get_chunk_size: Self::default_multi_get_chunk_size(),
             block_cache_size_mb: Self::default_block_cache_size_mb(),
@@ -67,10 +63,6 @@ impl Default for MerkleTreeConfig {
 impl MerkleTreeConfig {
     fn default_path() -> String {
         "./db/lightweight-new".to_owned() // named this way for legacy reasons
-    }
-
-    fn default_backup_path() -> String {
-        "./db/backups".to_owned()
     }
 
     const fn default_multi_get_chunk_size() -> usize {
@@ -120,36 +112,18 @@ pub struct DBConfig {
     // ^ Filled in separately in `Self::from_env()`. We cannot use `serde(flatten)` because it
     // doesn't work with 'envy`.
     pub merkle_tree: MerkleTreeConfig,
-    /// Number of backups to keep.
-    #[serde(default = "DBConfig::default_backup_count")]
-    pub backup_count: usize,
-    /// Time interval between performing backups.
-    #[serde(default = "DBConfig::default_backup_interval_ms")]
-    pub backup_interval_ms: u64,
 }
 
 impl DBConfig {
     fn default_state_keeper_db_path() -> String {
         "./db/state_keeper".to_owned()
     }
-
-    const fn default_backup_count() -> usize {
-        5
-    }
-
-    const fn default_backup_interval_ms() -> u64 {
-        60_000
-    }
-
-    pub fn backup_interval(&self) -> Duration {
-        Duration::from_millis(self.backup_interval_ms)
-    }
 }
 
 /// Collection of different database URLs and general PostgreSQL options.
 /// All the entries are optional, since some components may only require a subset of them,
 /// and any component may have overrides.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PostgresConfig {
     /// URL for the main (sequencer) database.
     pub master_url: Option<String>,
@@ -159,9 +133,21 @@ pub struct PostgresConfig {
     pub prover_url: Option<String>,
     /// Maximum size of the connection pool.
     pub max_connections: Option<u32>,
+    /// Maximum size of the connection pool to master DB.
+    pub max_connections_master: Option<u32>,
+
+    /// Acquire timeout in seconds for a single connection attempt. There are multiple attempts (currently 3)
+    /// before acquire methods will return an error.
+    pub acquire_timeout_sec: Option<u64>,
     /// Statement timeout in seconds for Postgres connections. Applies only to the replica
     /// connection pool used by the API servers.
     pub statement_timeout_sec: Option<u64>,
+    /// Threshold in milliseconds for the DB connection lifetime to denote it as long-living and log its details.
+    pub long_connection_threshold_ms: Option<u64>,
+    /// Threshold in milliseconds to denote a DB query as "slow" and log its details.
+    pub slow_query_threshold_ms: Option<u64>,
+    pub test_server_url: Option<String>,
+    pub test_prover_url: Option<String>,
 }
 
 impl PostgresConfig {
@@ -191,8 +177,25 @@ impl PostgresConfig {
         self.max_connections.context("Max connections is absent")
     }
 
+    pub fn max_connections_master(&self) -> Option<u32> {
+        self.max_connections_master
+    }
+
     /// Returns the Postgres statement timeout.
     pub fn statement_timeout(&self) -> Option<Duration> {
         self.statement_timeout_sec.map(Duration::from_secs)
+    }
+
+    /// Returns the acquire timeout for a single connection attempt.
+    pub fn acquire_timeout(&self) -> Option<Duration> {
+        self.acquire_timeout_sec.map(Duration::from_secs)
+    }
+
+    pub fn long_connection_threshold(&self) -> Option<Duration> {
+        self.long_connection_threshold_ms.map(Duration::from_millis)
+    }
+
+    pub fn slow_query_threshold(&self) -> Option<Duration> {
+        self.slow_query_threshold_ms.map(Duration::from_millis)
     }
 }

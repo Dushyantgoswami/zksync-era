@@ -77,8 +77,8 @@ be able to leverage them when available).
 - `BridgehubMailbox` routes messages to the Diamond proxy’s Mailbox facet based on chainID
 
   - Same as the current zkEVM
-    [Mailbox](https://github.com/matter-labs/era-contracts/blob/main/ethereum/contracts/zksync/facets/Mailbox.sol), just
-    with chainId,
+    [Mailbox](https://github.com/matter-labs/era-contracts/blob/main/l1-contracts/contracts/zksync/facets/Mailbox.sol),
+    just with chainId,
   - Ether needs to be deposited and withdrawn from here.
   - This is where L2 transactions can be requested.
 
@@ -119,8 +119,8 @@ be able to leverage them when available).
 
 - Some assets have to be natively supported (ETH, WETH) and it also makes sense to support some generally accepted token
   standards (ERC20 tokens), as this makes it easy to bridge those tokens (and ensures a single version of them exists on
-  the hyperchain). These cannonical asset contracts are deployed from L1 by a bridge shared by all hyperchains. This is
-  where assets are locked on L1. These bridges use the Bridgehub to communicate with all hyperchains. Currently, these
+  the hyperchain). These canonical asset contracts are deployed from L1 by a bridge shared by all hyperchains. This is
+  where assets are locked on L1. These bridges use the BridgeHub to communicate with all hyperchains. Currently, these
   bridges are the `WETH` and `ERC20` bridges.
 
   - The pair on L2 is deployed from L1. The hash of the factory dependencies is stored on L1, and when a hyperchain
@@ -140,8 +140,8 @@ be able to leverage them when available).
               _chainId,
               bridgehead,
               _deployBridgeProxyFee,
-              l2WethBridgeProxyBytecodeHash,
-              l2WethBridgeProxyConstructorData,
+              l2SharedBridgeProxyBytecodeHash,
+              l2SharedBridgeProxyConstructorData,
               // No factory deps are needed for L2 bridge proxy, because it is already passed in the previous step
               new bytes[](0)
           );
@@ -192,10 +192,10 @@ A chain registers in the Bridgehub, this is where the chain ID is determined. Th
 Transition that they plan to use. In the first version only a single State Transition contract will be available for
 use, our with Boojum proof verification.
 
-At initialization we prepare the `StateTransitionChain` contract. We store the genesis batch hash in the ST contract,
-all chains start out with the same state. A diamond proxy is deployed and initialised with this initial value, along
-with predefined facets which are made available by the ST contract. These facets contain the proof verification and
-other features required to process proofs. The chain ID is set in the VM in a special system transaction sent from L1.
+At initialization we prepare the `ZkSyncHyperchain` contract. We store the genesis batch hash in the ST contract, all
+chains start out with the same state. A diamond proxy is deployed and initialised with this initial value, along with
+predefined facets which are made available by the ST contract. These facets contain the proof verification and other
+features required to process proofs. The chain ID is set in the VM in a special system transaction sent from L1.
 
 <!--![newChain.png](./img/newChain.png) Image outdated-->
 

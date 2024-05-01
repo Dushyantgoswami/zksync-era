@@ -2,9 +2,9 @@
 
 use std::{sync::Arc, time::Instant};
 
+use prover_dal::{Connection, Prover, ProverDal};
 use tokio::sync::Mutex;
 use zkevm_test_harness::prover_utils::{verify_base_layer_proof, verify_recursion_layer_proof};
-use zksync_dal::StorageProcessor;
 use zksync_object_store::ObjectStore;
 use zksync_prover_fri_types::{
     circuit_definitions::{
@@ -12,11 +12,7 @@ use zksync_prover_fri_types::{
             algebraic_props::{
                 round_function::AbsorptionModeOverwrite, sponge::GoldilocksPoseidon2Sponge,
             },
-            config::ProvingCSConfig,
-            cs::implementations::{
-                pow::NoPow, proof::Proof, reference_cs::CSReferenceAssembly,
-                verifier::VerificationKey,
-            },
+            cs::implementations::{pow::NoPow, proof::Proof, verifier::VerificationKey},
             field::goldilocks::{GoldilocksExt2, GoldilocksField},
         },
         circuit_definitions::recursion_layer::{
@@ -26,8 +22,10 @@ use zksync_prover_fri_types::{
     queue::FixedSizeQueue,
     CircuitWrapper, FriProofWrapper, ProverServiceDataKey, WitnessVectorArtifacts,
 };
-use zksync_prover_fri_utils::get_base_layer_circuit_id_for_recursive_layer;
-use zksync_types::{basic_fri_types::CircuitIdRoundTuple, proofs::AggregationRound, L1BatchNumber};
+use zksync_types::{
+    basic_fri_types::{AggregationRound, CircuitIdRoundTuple},
+    L1BatchNumber,
+};
 
 use crate::metrics::METRICS;
 
@@ -35,8 +33,6 @@ pub type F = GoldilocksField;
 pub type H = GoldilocksPoseidon2Sponge<AbsorptionModeOverwrite>;
 pub type Ext = GoldilocksExt2;
 
-#[cfg(feature = "gpu")]
-pub type ProvingAssembly = CSReferenceAssembly<F, F, ProvingCSConfig>;
 #[cfg(feature = "gpu")]
 pub type SharedWitnessVectorQueue = Arc<Mutex<FixedSizeQueue<GpuProverJob>>>;
 
@@ -57,7 +53,6 @@ impl ProverArtifacts {
 #[cfg(feature = "gpu")]
 pub struct GpuProverJob {
     pub witness_vector_artifacts: WitnessVectorArtifacts,
-    pub assembly: ProvingAssembly,
 }
 
 pub async fn save_proof(
@@ -67,7 +62,7 @@ pub async fn save_proof(
     blob_store: &dyn ObjectStore,
     public_blob_store: Option<&dyn ObjectStore>,
     shall_save_to_public_bucket: bool,
-    storage_processor: &mut StorageProcessor<'_>,
+    storage_processor: &mut Connection<'_, Prover>,
 ) {
     tracing::info!(
         "Successfully proven job: {}, total time taken: {:?}",
@@ -101,7 +96,7 @@ pub async fn save_proof(
     METRICS.blob_save_time[&circuit_type.to_string()].observe(blob_save_started_at.elapsed());
 
     let mut transaction = storage_processor.start_transaction().await.unwrap();
-    let job_metadata = transaction
+    transaction
         .fri_prover_jobs_dal()
         .save_proof(job_id, started_at.elapsed(), &blob_url)
         .await;
@@ -109,16 +104,6 @@ pub async fn save_proof(
         transaction
             .fri_proof_compressor_dal()
             .insert_proof_compression_job(artifacts.block_number, &blob_url)
-            .await;
-    }
-    if job_metadata.is_node_final_proof {
-        transaction
-            .fri_scheduler_dependency_tracker_dal()
-            .set_final_prover_job_id_for_l1_batch(
-                get_base_layer_circuit_id_for_recursive_layer(job_metadata.circuit_id),
-                job_id,
-                job_metadata.block_number,
-            )
             .await;
     }
     transaction.commit().await.unwrap();
@@ -145,9 +130,7 @@ pub fn verify_proof(
     METRICS.proof_verification_time[&circuit_id.to_string()].observe(started_at.elapsed());
 
     if !is_valid {
-        let msg = format!(
-            "Failed to verify base layer proof for job-id: {job_id} circuit_type {circuit_id}"
-        );
+        let msg = format!("Failed to verify proof for job-id: {job_id} circuit_type {circuit_id}");
         tracing::error!("{}", msg);
         panic!("{}", msg);
     }
@@ -192,7 +175,7 @@ mod tests {
 
         let result = get_setup_data_key(key);
 
-        // Check if the circuit_id has been changed to NodeLayerCircuit's id
+        // Check if the `circuit_id` has been changed to `NodeLayerCircuit's` id
         assert_eq!(expected, result);
     }
 

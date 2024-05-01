@@ -1,22 +1,24 @@
+use std::sync::Arc;
+
 use zksync_config::configs::eth_sender::{ProofLoadingMode, ProofSendingMode, SenderConfig};
 use zksync_contracts::BaseSystemContractsHashes;
-use zksync_dal::StorageProcessor;
-use zksync_object_store::ObjectStore;
-use zksync_prover_utils::gcs_proof_fetcher::load_wrapped_fri_proofs_for_range;
+use zksync_dal::{Connection, Core, CoreDal};
+use zksync_l1_contract_interface::i_executor::methods::{ExecuteBatches, ProveBatches};
+use zksync_object_store::{ObjectStore, ObjectStoreError};
+use zksync_prover_interface::outputs::L1BatchProofForL1;
 use zksync_types::{
-    aggregated_operations::{
-        AggregatedActionType, AggregatedOperation, L1BatchCommitOperation, L1BatchExecuteOperation,
-        L1BatchProofOperation,
-    },
-    commitment::L1BatchWithMetadata,
-    helpers::unix_timestamp_ms,
-    protocol_version::L1VerifierConfig,
+    aggregated_operations::AggregatedActionType, commitment::L1BatchWithMetadata,
+    helpers::unix_timestamp_ms, protocol_version::L1VerifierConfig, pubdata_da::PubdataDA,
     L1BatchNumber, ProtocolVersionId,
 };
 
-use super::publish_criterion::{
-    DataSizeCriterion, GasCriterion, L1BatchPublishCriterion, NumberCriterion,
-    TimestampDeadlineCriterion,
+use super::{
+    aggregated_operations::AggregatedOperation,
+    l1_batch_commit_data_generator::L1BatchCommitDataGenerator,
+    publish_criterion::{
+        DataSizeCriterion, GasCriterion, L1BatchPublishCriterion, NumberCriterion,
+        TimestampDeadlineCriterion,
+    },
 };
 
 #[derive(Debug)]
@@ -25,11 +27,25 @@ pub struct Aggregator {
     proof_criteria: Vec<Box<dyn L1BatchPublishCriterion>>,
     execute_criteria: Vec<Box<dyn L1BatchPublishCriterion>>,
     config: SenderConfig,
-    blob_store: Box<dyn ObjectStore>,
+    blob_store: Arc<dyn ObjectStore>,
+    /// If we are operating in 4844 mode we need to wait for commit transaction
+    /// to get included before sending the respective prove and execute transactions.
+    /// In non-4844 mode of operation we operate with the single address and this
+    /// means no wait is needed: nonces will still provide the correct ordering of
+    /// transactions.
+    operate_4844_mode: bool,
+    pubdata_da: PubdataDA,
 }
 
 impl Aggregator {
-    pub fn new(config: SenderConfig, blob_store: Box<dyn ObjectStore>) -> Self {
+    pub fn new(
+        config: SenderConfig,
+        blob_store: Arc<dyn ObjectStore>,
+        operate_4844_mode: bool,
+        l1_batch_commit_data_generator: Arc<dyn L1BatchCommitDataGenerator>,
+    ) -> Self {
+        let pubdata_da = config.pubdata_sending_mode.into();
+
         Self {
             commit_criteria: vec![
                 Box::from(NumberCriterion {
@@ -43,6 +59,8 @@ impl Aggregator {
                 Box::from(DataSizeCriterion {
                     op: AggregatedActionType::Commit,
                     data_limit: config.max_eth_tx_data_size,
+                    pubdata_da,
+                    l1_batch_commit_data_generator,
                 }),
                 Box::from(TimestampDeadlineCriterion {
                     op: AggregatedActionType::Commit,
@@ -85,22 +103,27 @@ impl Aggregator {
             ],
             config,
             blob_store,
+            operate_4844_mode,
+            pubdata_da,
         }
     }
 
     pub async fn get_next_ready_operation(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
-        prover_storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         base_system_contracts_hashes: BaseSystemContractsHashes,
         protocol_version_id: ProtocolVersionId,
         l1_verifier_config: L1VerifierConfig,
     ) -> Option<AggregatedOperation> {
-        let last_sealed_l1_batch_number = storage
+        let Some(last_sealed_l1_batch_number) = storage
             .blocks_dal()
             .get_sealed_l1_batch_number()
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            return None; // No L1 batches in Postgres; no operations are ready yet
+        };
+
         if let Some(op) = self
             .get_execute_operations(
                 storage,
@@ -113,7 +136,6 @@ impl Aggregator {
         } else if let Some(op) = self
             .get_proof_operation(
                 storage,
-                prover_storage,
                 *self.config.aggregated_proof_sizes.iter().max().unwrap(),
                 last_sealed_l1_batch_number,
                 l1_verifier_config,
@@ -130,16 +152,15 @@ impl Aggregator {
                 protocol_version_id,
             )
             .await
-            .map(AggregatedOperation::Commit)
         }
     }
 
     async fn get_execute_operations(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         limit: usize,
         last_sealed_l1_batch: L1BatchNumber,
-    ) -> Option<L1BatchExecuteOperation> {
+    ) -> Option<ExecuteBatches> {
         let max_l1_batch_timestamp_millis = self
             .config
             .l1_batch_min_age_before_execute_seconds
@@ -157,17 +178,17 @@ impl Aggregator {
         )
         .await;
 
-        l1_batches.map(|l1_batches| L1BatchExecuteOperation { l1_batches })
+        l1_batches.map(|l1_batches| ExecuteBatches { l1_batches })
     }
 
     async fn get_commit_operation(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         limit: usize,
         last_sealed_batch: L1BatchNumber,
         base_system_contracts_hashes: BaseSystemContractsHashes,
         protocol_version_id: ProtocolVersionId,
-    ) -> Option<L1BatchCommitOperation> {
+    ) -> Option<AggregatedOperation> {
         let mut blocks_dal = storage.blocks_dal();
         let last_committed_l1_batch = blocks_dal
             .get_last_committed_to_eth_l1_batch()
@@ -215,19 +236,62 @@ impl Aggregator {
         )
         .await;
 
-        batches.map(|batches| L1BatchCommitOperation {
-            last_committed_l1_batch,
-            l1_batches: batches,
+        batches.map(|batches| {
+            AggregatedOperation::Commit(last_committed_l1_batch, batches, self.pubdata_da)
         })
     }
 
+    async fn load_dummy_proof_operations(
+        storage: &mut Connection<'_, Core>,
+        limit: usize,
+        is_4844_mode: bool,
+    ) -> Vec<L1BatchWithMetadata> {
+        let mut ready_for_proof_l1_batches = storage
+            .blocks_dal()
+            .get_ready_for_dummy_proof_l1_batches(limit)
+            .await
+            .unwrap();
+
+        // need to find first batch with an unconfirmed commit transaction
+        // and discard it and all the following ones.
+        if is_4844_mode {
+            let mut committed_batches = vec![];
+
+            for batch in ready_for_proof_l1_batches.into_iter() {
+                let Some(commit_tx_id) = storage
+                    .blocks_dal()
+                    .get_eth_commit_tx_id(batch.header.number)
+                    .await
+                    .unwrap()
+                else {
+                    break;
+                };
+
+                if storage
+                    .eth_sender_dal()
+                    .get_confirmed_tx_hash_by_eth_tx_id(commit_tx_id as u32)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    break;
+                }
+                committed_batches.push(batch);
+            }
+
+            ready_for_proof_l1_batches = committed_batches;
+        }
+
+        ready_for_proof_l1_batches
+    }
+
     async fn load_real_proof_operation(
-        storage: &mut StorageProcessor<'_>,
-        prover_storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         l1_verifier_config: L1VerifierConfig,
         proof_loading_mode: &ProofLoadingMode,
         blob_store: &dyn ObjectStore,
-    ) -> Option<L1BatchProofOperation> {
+        is_4844_mode: bool,
+    ) -> Option<ProveBatches> {
         let previous_proven_batch_number = storage
             .blocks_dal()
             .get_last_l1_batch_with_prove_tx()
@@ -236,11 +300,22 @@ impl Aggregator {
         let batch_to_prove = previous_proven_batch_number + 1;
 
         // Return `None` if batch is not committed yet.
-        storage
+        let commit_tx_id = storage
             .blocks_dal()
             .get_eth_commit_tx_id(batch_to_prove)
             .await
             .unwrap()?;
+
+        if is_4844_mode
+            && storage
+                .eth_sender_dal()
+                .get_confirmed_tx_hash_by_eth_tx_id(commit_tx_id as u32)
+                .await
+                .unwrap()
+                .is_none()
+        {
+            return None;
+        }
 
         if let Some(version_id) = storage
             .blocks_dal()
@@ -259,10 +334,7 @@ impl Aggregator {
         }
         let proofs = match proof_loading_mode {
             ProofLoadingMode::OldProofFromDb => {
-                prover_storage
-                    .prover_dal()
-                    .get_final_proofs_for_blocks(batch_to_prove, batch_to_prove)
-                    .await
+                unreachable!("OldProofFromDb is not supported anymore")
             }
             ProofLoadingMode::FriProofFromGcs => {
                 load_wrapped_fri_proofs_for_range(batch_to_prove, batch_to_prove, blob_store).await
@@ -298,7 +370,7 @@ impl Aggregator {
                 );
             });
 
-        Some(L1BatchProofOperation {
+        Some(ProveBatches {
             prev_l1_batch: previous_proven_batch_metadata,
             l1_batches: vec![metadata_for_batch_being_proved],
             proofs,
@@ -308,10 +380,10 @@ impl Aggregator {
 
     async fn prepare_dummy_proof_operation(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         ready_for_proof_l1_batches: Vec<L1BatchWithMetadata>,
         last_sealed_l1_batch: L1BatchNumber,
-    ) -> Option<L1BatchProofOperation> {
+    ) -> Option<ProveBatches> {
         let batches = extract_ready_subrange(
             storage,
             &mut self.proof_criteria,
@@ -327,7 +399,7 @@ impl Aggregator {
             .await
             .unwrap()?;
 
-        Some(L1BatchProofOperation {
+        Some(ProveBatches {
             prev_l1_batch: prev_batch,
             l1_batches: batches,
             proofs: vec![],
@@ -337,30 +409,26 @@ impl Aggregator {
 
     async fn get_proof_operation(
         &mut self,
-        storage: &mut StorageProcessor<'_>,
-        prover_storage: &mut StorageProcessor<'_>,
+        storage: &mut Connection<'_, Core>,
         limit: usize,
         last_sealed_l1_batch: L1BatchNumber,
         l1_verifier_config: L1VerifierConfig,
-    ) -> Option<L1BatchProofOperation> {
+    ) -> Option<ProveBatches> {
         match self.config.proof_sending_mode {
             ProofSendingMode::OnlyRealProofs => {
                 Self::load_real_proof_operation(
                     storage,
-                    prover_storage,
                     l1_verifier_config,
                     &self.config.proof_loading_mode,
                     &*self.blob_store,
+                    self.operate_4844_mode,
                 )
                 .await
             }
 
             ProofSendingMode::SkipEveryProof => {
-                let ready_for_proof_l1_batches = storage
-                    .blocks_dal()
-                    .get_ready_for_dummy_proof_l1_batches(limit)
-                    .await
-                    .unwrap();
+                let ready_for_proof_l1_batches =
+                    Self::load_dummy_proof_operations(storage, limit, self.operate_4844_mode).await;
                 self.prepare_dummy_proof_operation(
                     storage,
                     ready_for_proof_l1_batches,
@@ -373,10 +441,10 @@ impl Aggregator {
                 // if there is a sampled proof then send it, otherwise check for skipped ones.
                 if let Some(op) = Self::load_real_proof_operation(
                     storage,
-                    prover_storage,
                     l1_verifier_config,
                     &self.config.proof_loading_mode,
                     &*self.blob_store,
+                    self.operate_4844_mode,
                 )
                 .await
                 {
@@ -397,10 +465,14 @@ impl Aggregator {
             }
         }
     }
+
+    pub fn pubdata_da(&self) -> PubdataDA {
+        self.pubdata_da
+    }
 }
 
 async fn extract_ready_subrange(
-    storage: &mut StorageProcessor<'_>,
+    storage: &mut Connection<'_, Core>,
     publish_criteria: &mut [Box<dyn L1BatchPublishCriterion>],
     unpublished_l1_batches: Vec<L1BatchWithMetadata>,
     last_sealed_l1_batch: L1BatchNumber,
@@ -422,4 +494,24 @@ async fn extract_ready_subrange(
             .take_while(|l1_batch| l1_batch.header.number <= last_l1_batch)
             .collect(),
     )
+}
+
+pub async fn load_wrapped_fri_proofs_for_range(
+    from: L1BatchNumber,
+    to: L1BatchNumber,
+    blob_store: &dyn ObjectStore,
+) -> Vec<L1BatchProofForL1> {
+    let mut proofs = Vec::new();
+    for l1_batch_number in from.0..=to.0 {
+        let l1_batch_number = L1BatchNumber(l1_batch_number);
+        match blob_store.get(l1_batch_number).await {
+            Ok(proof) => proofs.push(proof),
+            Err(ObjectStoreError::KeyNotFound(_)) => (), // do nothing, proof is not ready yet
+            Err(err) => panic!(
+                "Failed to load proof for batch {}: {}",
+                l1_batch_number.0, err
+            ),
+        }
+    }
+    proofs
 }

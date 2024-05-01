@@ -1,18 +1,23 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 
-use multivm::vm_latest::utils::fee::derive_base_fee_and_gas_per_pubdata;
+use anyhow::Context as _;
+use rand::{thread_rng, Rng};
 use tokio::runtime::Handle;
-use zksync_dal::{ConnectionPool, SqlxError, StorageProcessor};
-use zksync_state::{PostgresStorage, PostgresStorageCaches, ReadStorage, StorageView};
-use zksync_system_constants::PUBLISH_BYTECODE_OVERHEAD;
-use zksync_types::{api, AccountTreeId, L2ChainId, MiniblockNumber, U256};
-use zksync_utils::bytecode::{compress_bytecode, hash_bytecode};
+use zksync_dal::{pruning_dal::PruningInfo, Connection, Core, CoreDal, DalError};
+use zksync_state::PostgresStorageCaches;
+use zksync_types::{
+    api, fee_model::BatchFeeInput, AccountTreeId, Address, L1BatchNumber, L2BlockNumber, L2ChainId,
+};
 
 use self::vm_metrics::SandboxStage;
 pub(super) use self::{
     error::SandboxExecutionError,
-    execute::{execute_tx_eth_call, execute_tx_with_pending_state, TxExecutionArgs},
+    execute::{TransactionExecutor, TxExecutionArgs},
     tracers::ApiTracer,
+    validate::ValidationError,
     vm_metrics::{SubmitTxStage, SANDBOX_METRICS},
 };
 use super::tx_sender::MultiVMBaseSystemContracts;
@@ -21,6 +26,10 @@ use super::tx_sender::MultiVMBaseSystemContracts;
 mod apply;
 mod error;
 mod execute;
+#[cfg(test)]
+pub(super) mod testonly;
+#[cfg(test)]
+mod tests;
 mod tracers;
 mod validate;
 mod vm_metrics;
@@ -141,157 +150,265 @@ impl VmConcurrencyLimiter {
     }
 }
 
-pub(super) fn adjust_l1_gas_price_for_tx(
-    l1_gas_price: u64,
-    fair_l2_gas_price: u64,
-    tx_gas_per_pubdata_limit: U256,
-) -> u64 {
-    let (_, current_pubdata_price) =
-        derive_base_fee_and_gas_per_pubdata(l1_gas_price, fair_l2_gas_price);
-    if U256::from(current_pubdata_price) <= tx_gas_per_pubdata_limit {
-        // The current pubdata price is small enough
-        l1_gas_price
-    } else {
-        // gasPerPubdata = ceil(17 * l1gasprice / fair_l2_gas_price)
-        // gasPerPubdata <= 17 * l1gasprice / fair_l2_gas_price + 1
-        // fair_l2_gas_price(gasPerPubdata - 1) / 17 <= l1gasprice
-        let l1_gas_price = U256::from(fair_l2_gas_price)
-            * (tx_gas_per_pubdata_limit - U256::from(1u32))
-            / U256::from(17);
-
-        l1_gas_price.as_u64()
-    }
-}
-
 async fn get_pending_state(
-    connection: &mut StorageProcessor<'_>,
-) -> (api::BlockId, MiniblockNumber) {
+    connection: &mut Connection<'_, Core>,
+) -> anyhow::Result<(api::BlockId, L2BlockNumber)> {
     let block_id = api::BlockId::Number(api::BlockNumber::Pending);
     let resolved_block_number = connection
         .blocks_web3_dal()
         .resolve_block_id(block_id)
         .await
-        .unwrap()
-        .expect("Pending block should be present");
-    (block_id, resolved_block_number)
-}
-
-/// Returns the number of the pubdata that the transaction will spend on factory deps.
-pub(super) async fn get_pubdata_for_factory_deps(
-    _vm_permit: &VmPermit,
-    connection_pool: &ConnectionPool,
-    factory_deps: &[Vec<u8>],
-    storage_caches: PostgresStorageCaches,
-) -> u32 {
-    if factory_deps.is_empty() {
-        return 0; // Shortcut for the common case allowing to not acquire DB connections etc.
-    }
-
-    let mut connection = connection_pool.access_storage_tagged("api").await.unwrap();
-    let (_, block_number) = get_pending_state(&mut connection).await;
-    drop(connection);
-
-    let rt_handle = Handle::current();
-    let connection_pool = connection_pool.clone();
-    let factory_deps = factory_deps.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let connection = rt_handle
-            .block_on(connection_pool.access_storage_tagged("api"))
-            .unwrap();
-        let storage = PostgresStorage::new(rt_handle, connection, block_number, false)
-            .with_caches(storage_caches);
-        let mut storage_view = StorageView::new(storage);
-
-        let effective_lengths = factory_deps.iter().map(|bytecode| {
-            if storage_view.is_bytecode_known(&hash_bytecode(bytecode)) {
-                return 0;
-            }
-
-            let length = if let Ok(compressed) = compress_bytecode(bytecode) {
-                compressed.len()
-            } else {
-                bytecode.len()
-            };
-            length as u32 + PUBLISH_BYTECODE_OVERHEAD
-        });
-        effective_lengths.sum()
-    })
-    .await
-    .unwrap()
+        .map_err(DalError::generalize)?
+        .context("pending block should always be present in Postgres")?;
+    Ok((block_id, resolved_block_number))
 }
 
 /// Arguments for VM execution not specific to a particular transaction.
 #[derive(Debug, Clone)]
 pub(crate) struct TxSharedArgs {
     pub operator_account: AccountTreeId,
-    pub l1_gas_price: u64,
-    pub fair_l2_gas_price: u64,
+    pub fee_input: BatchFeeInput,
     pub base_system_contracts: MultiVMBaseSystemContracts,
     pub caches: PostgresStorageCaches,
     pub validation_computational_gas_limit: u32,
     pub chain_id: L2ChainId,
+    pub whitelisted_tokens_for_aa: Vec<Address>,
+}
+
+impl TxSharedArgs {
+    #[cfg(test)]
+    pub fn mock(base_system_contracts: MultiVMBaseSystemContracts) -> Self {
+        Self {
+            operator_account: AccountTreeId::default(),
+            fee_input: BatchFeeInput::l1_pegged(55, 555),
+            base_system_contracts,
+            caches: PostgresStorageCaches::new(1, 1),
+            validation_computational_gas_limit: u32::MAX,
+            chain_id: L2ChainId::default(),
+            whitelisted_tokens_for_aa: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockStartInfoInner {
+    info: PruningInfo,
+    cached_at: Instant,
+}
+
+impl BlockStartInfoInner {
+    // We make max age a bit random so that all threads don't start refreshing cache at the same time
+    const MAX_RANDOM_DELAY: Duration = Duration::from_millis(100);
+
+    fn is_expired(&self, now: Instant, max_cache_age: Duration) -> bool {
+        if let Some(expired_for) = (now - self.cached_at).checked_sub(max_cache_age) {
+            if expired_for > Self::MAX_RANDOM_DELAY {
+                return true; // The cache is definitely expired, regardless of the randomness below
+            }
+            // Minimize access to RNG, which could be mildly costly
+            expired_for > thread_rng().gen_range(Duration::ZERO..=Self::MAX_RANDOM_DELAY)
+        } else {
+            false // `now` is close to `self.cached_at`; the cache isn't expired
+        }
+    }
+}
+
+/// Information about first L1 batch / L2 block in the node storage.
+#[derive(Debug, Clone)]
+pub(crate) struct BlockStartInfo {
+    cached_pruning_info: Arc<RwLock<BlockStartInfoInner>>,
+    max_cache_age: Duration,
+}
+
+impl BlockStartInfo {
+    pub async fn new(
+        storage: &mut Connection<'_, Core>,
+        max_cache_age: Duration,
+    ) -> anyhow::Result<Self> {
+        let info = storage.pruning_dal().get_pruning_info().await?;
+        Ok(Self {
+            cached_pruning_info: Arc::new(RwLock::new(BlockStartInfoInner {
+                info,
+                cached_at: Instant::now(),
+            })),
+            max_cache_age,
+        })
+    }
+
+    fn copy_inner(&self) -> BlockStartInfoInner {
+        *self
+            .cached_pruning_info
+            .read()
+            .expect("BlockStartInfo is poisoned")
+    }
+
+    async fn update_cache(
+        &self,
+        storage: &mut Connection<'_, Core>,
+        now: Instant,
+    ) -> anyhow::Result<PruningInfo> {
+        let info = storage.pruning_dal().get_pruning_info().await?;
+
+        let mut new_cached_pruning_info = self
+            .cached_pruning_info
+            .write()
+            .map_err(|_| anyhow::anyhow!("BlockStartInfo is poisoned"))?;
+        Ok(if new_cached_pruning_info.cached_at < now {
+            *new_cached_pruning_info = BlockStartInfoInner {
+                info,
+                cached_at: now,
+            };
+            info
+        } else {
+            // Got a newer cache already; no need to update it again.
+            new_cached_pruning_info.info
+        })
+    }
+
+    async fn get_pruning_info(
+        &self,
+        storage: &mut Connection<'_, Core>,
+    ) -> anyhow::Result<PruningInfo> {
+        let inner = self.copy_inner();
+        let now = Instant::now();
+        if inner.is_expired(now, self.max_cache_age) {
+            // Multiple threads may execute this query if we're very unlucky
+            self.update_cache(storage, now).await
+        } else {
+            Ok(inner.info)
+        }
+    }
+
+    pub async fn first_l2_block(
+        &self,
+        storage: &mut Connection<'_, Core>,
+    ) -> anyhow::Result<L2BlockNumber> {
+        let cached_pruning_info = self.get_pruning_info(storage).await?;
+        let last_block = cached_pruning_info.last_soft_pruned_l2_block;
+        if let Some(L2BlockNumber(last_block)) = last_block {
+            return Ok(L2BlockNumber(last_block + 1));
+        }
+        Ok(L2BlockNumber(0))
+    }
+
+    pub async fn first_l1_batch(
+        &self,
+        storage: &mut Connection<'_, Core>,
+    ) -> anyhow::Result<L1BatchNumber> {
+        let cached_pruning_info = self.get_pruning_info(storage).await?;
+        let last_batch = cached_pruning_info.last_soft_pruned_l1_batch;
+        if let Some(L1BatchNumber(last_block)) = last_batch {
+            return Ok(L1BatchNumber(last_block + 1));
+        }
+        Ok(L1BatchNumber(0))
+    }
+
+    /// Checks whether a block with the specified ID is pruned and returns an error if it is.
+    /// The `Err` variant wraps the first non-pruned L2 block.
+    pub async fn ensure_not_pruned_block(
+        &self,
+        block: api::BlockId,
+        storage: &mut Connection<'_, Core>,
+    ) -> Result<(), BlockArgsError> {
+        let first_l2_block = self
+            .first_l2_block(storage)
+            .await
+            .map_err(BlockArgsError::Database)?;
+        match block {
+            api::BlockId::Number(api::BlockNumber::Number(number))
+                if number < first_l2_block.0.into() =>
+            {
+                Err(BlockArgsError::Pruned(first_l2_block))
+            }
+            api::BlockId::Number(api::BlockNumber::Earliest)
+                if first_l2_block > L2BlockNumber(0) =>
+            {
+                Err(BlockArgsError::Pruned(first_l2_block))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BlockArgsError {
+    #[error("Block is pruned; first retained block is {0}")]
+    Pruned(L2BlockNumber),
+    #[error("Block is missing, but can appear in the future")]
+    Missing,
+    #[error("Database error")]
+    Database(#[from] anyhow::Error),
 }
 
 /// Information about a block provided to VM.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlockArgs {
     block_id: api::BlockId,
-    resolved_block_number: MiniblockNumber,
+    resolved_block_number: L2BlockNumber,
     l1_batch_timestamp_s: Option<u64>,
 }
 
 impl BlockArgs {
-    async fn pending(connection: &mut StorageProcessor<'_>) -> Self {
-        let (block_id, resolved_block_number) = get_pending_state(connection).await;
-        Self {
+    pub(crate) async fn pending(connection: &mut Connection<'_, Core>) -> anyhow::Result<Self> {
+        let (block_id, resolved_block_number) = get_pending_state(connection).await?;
+        Ok(Self {
             block_id,
             resolved_block_number,
             l1_batch_timestamp_s: None,
-        }
+        })
     }
 
     /// Loads block information from DB.
     pub async fn new(
-        connection: &mut StorageProcessor<'_>,
+        connection: &mut Connection<'_, Core>,
         block_id: api::BlockId,
-    ) -> Result<Option<Self>, SqlxError> {
+        start_info: &BlockStartInfo,
+    ) -> Result<Self, BlockArgsError> {
+        // We need to check that `block_id` is present in Postgres or can be present in the future
+        // (i.e., it does not refer to a pruned block). If called for a pruned block, the returned value
+        // (specifically, `l1_batch_timestamp_s`) will be nonsensical.
+        start_info
+            .ensure_not_pruned_block(block_id, connection)
+            .await?;
+
         if block_id == api::BlockId::Number(api::BlockNumber::Pending) {
-            return Ok(Some(BlockArgs::pending(connection).await));
+            return Ok(BlockArgs::pending(connection).await?);
         }
 
         let resolved_block_number = connection
             .blocks_web3_dal()
             .resolve_block_id(block_id)
-            .await?;
+            .await
+            .map_err(DalError::generalize)?;
         let Some(resolved_block_number) = resolved_block_number else {
-            return Ok(None);
+            return Err(BlockArgsError::Missing);
         };
 
-        let l1_batch_number = connection
+        let l1_batch = connection
             .storage_web3_dal()
-            .resolve_l1_batch_number_of_miniblock(resolved_block_number)
-            .await?
-            .expected_l1_batch();
-        let l1_batch_timestamp_s = connection
+            .resolve_l1_batch_number_of_l2_block(resolved_block_number)
+            .await
+            .with_context(|| {
+                format!("failed resolving L1 batch number of L2 block #{resolved_block_number}")
+            })?;
+        let l1_batch_timestamp = connection
             .blocks_web3_dal()
-            .get_expected_l1_batch_timestamp(l1_batch_number)
-            .await?;
-        assert!(
-            l1_batch_timestamp_s.is_some(),
-            "Missing batch timestamp for non-pending block"
-        );
-        Ok(Some(Self {
+            .get_expected_l1_batch_timestamp(&l1_batch)
+            .await
+            .map_err(DalError::generalize)?
+            .context("missing timestamp for non-pending block")?;
+        Ok(Self {
             block_id,
             resolved_block_number,
-            l1_batch_timestamp_s,
-        }))
+            l1_batch_timestamp_s: Some(l1_batch_timestamp),
+        })
     }
 
-    pub fn resolved_block_number(&self) -> MiniblockNumber {
+    pub fn resolved_block_number(&self) -> L2BlockNumber {
         self.resolved_block_number
     }
 
-    pub fn resolves_to_latest_sealed_miniblock(&self) -> bool {
+    pub fn resolves_to_latest_sealed_l2_block(&self) -> bool {
         matches!(
             self.block_id,
             api::BlockId::Number(

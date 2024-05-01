@@ -1,10 +1,14 @@
-use std::{convert::TryInto, time::Instant};
+use std::{convert::TryInto, sync::Arc, time::Instant};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use prover_dal::{Prover, ProverDal};
+use zkevm_test_harness::zkevm_circuits::recursion::{
+    leaf_layer::input::RecursionLeafParametersWitness, NUM_BASE_LAYER_CIRCUITS,
+};
 use zksync_config::configs::FriWitnessGeneratorConfig;
 use zksync_dal::ConnectionPool;
-use zksync_object_store::{FriCircuitKey, ObjectStore, ObjectStoreFactory};
+use zksync_object_store::{ObjectStore, ObjectStoreFactory};
 use zksync_prover_fri_types::{
     circuit_definitions::{
         boojum::{
@@ -18,20 +22,17 @@ use zksync_prover_fri_types::{
         recursion_layer_proof_config,
         zkevm_circuits::scheduler::{input::SchedulerCircuitInstanceWitness, SchedulerConfig},
     },
-    get_current_pod_name, CircuitWrapper, FriProofWrapper,
+    get_current_pod_name,
+    keys::FriCircuitKey,
+    CircuitWrapper, FriProofWrapper,
 };
 use zksync_queued_job_processor::JobProcessor;
 use zksync_types::{
-    proofs::AggregationRound, protocol_version::FriProtocolVersionId, L1BatchNumber,
+    basic_fri_types::AggregationRound, protocol_version::ProtocolVersionId, L1BatchNumber,
 };
-use zksync_vk_setup_data_server_fri::{
-    get_recursive_layer_vk_for_circuit_type, utils::get_leaf_vk_params,
-};
+use zksync_vk_setup_data_server_fri::{keystore::Keystore, utils::get_leaf_vk_params};
 
-use crate::{
-    metrics::WITNESS_GENERATOR_METRICS,
-    utils::{load_proofs_for_job_ids, SchedulerPartialInputWrapper},
-};
+use crate::{metrics::WITNESS_GENERATOR_METRICS, utils::SchedulerPartialInputWrapper};
 
 pub struct SchedulerArtifacts {
     pub scheduler_circuit: ZkSyncRecursiveLayerCircuit,
@@ -46,22 +47,25 @@ pub struct SchedulerWitnessGeneratorJob {
         GoldilocksExt2,
     >,
     node_vk: ZkSyncRecursionLayerVerificationKey,
+    recursion_tip_vk: ZkSyncRecursionLayerVerificationKey,
+    leaf_layer_parameters:
+        [RecursionLeafParametersWitness<GoldilocksField>; NUM_BASE_LAYER_CIRCUITS],
 }
 
 #[derive(Debug)]
 pub struct SchedulerWitnessGenerator {
     config: FriWitnessGeneratorConfig,
-    object_store: Box<dyn ObjectStore>,
-    prover_connection_pool: ConnectionPool,
-    protocol_versions: Vec<FriProtocolVersionId>,
+    object_store: Arc<dyn ObjectStore>,
+    prover_connection_pool: ConnectionPool<Prover>,
+    protocol_versions: Vec<ProtocolVersionId>,
 }
 
 impl SchedulerWitnessGenerator {
     pub async fn new(
         config: FriWitnessGeneratorConfig,
         store_factory: &ObjectStoreFactory,
-        prover_connection_pool: ConnectionPool,
-        protocol_versions: Vec<FriProtocolVersionId>,
+        prover_connection_pool: ConnectionPool<Prover>,
+        protocol_versions: Vec<ProtocolVersionId>,
     ) -> Self {
         Self {
             config,
@@ -82,9 +86,12 @@ impl SchedulerWitnessGenerator {
         );
         let config = SchedulerConfig {
             proof_config: recursion_layer_proof_config(),
-            vk_fixed_parameters: job.node_vk.into_inner().fixed_parameters,
+            vk_fixed_parameters: job.recursion_tip_vk.clone().into_inner().fixed_parameters,
             capacity: SCHEDULER_CAPACITY,
             _marker: std::marker::PhantomData,
+            recursion_tip_vk: job.recursion_tip_vk.into_inner(),
+            node_layer_vk: job.node_vk.into_inner(),
+            leaf_layer_parameters: job.leaf_layer_parameters,
         };
 
         let scheduler_circuit = SchedulerCircuit {
@@ -117,7 +124,7 @@ impl JobProcessor for SchedulerWitnessGenerator {
     const SERVICE_NAME: &'static str = "fri_scheduler_witness_generator";
 
     async fn get_next_job(&self) -> anyhow::Result<Option<(Self::JobId, Self::Job)>> {
-        let mut prover_connection = self.prover_connection_pool.access_storage().await.unwrap();
+        let mut prover_connection = self.prover_connection_pool.connection().await?;
         let pod_name = get_current_pod_name();
         let Some(l1_batch_number) = prover_connection
             .fri_witness_generator_dal()
@@ -126,14 +133,18 @@ impl JobProcessor for SchedulerWitnessGenerator {
         else {
             return Ok(None);
         };
-        let proof_job_ids = prover_connection
-            .fri_scheduler_dependency_tracker_dal()
-            .get_final_prover_job_ids_for(l1_batch_number)
-            .await;
+        let recursion_tip_job_id = prover_connection
+            .fri_prover_jobs_dal()
+            .get_recursion_tip_proof_job_id(l1_batch_number)
+            .await
+            .context(format!(
+                "could not find recursion tip proof for l1 batch {}",
+                l1_batch_number
+            ))?;
 
         Ok(Some((
             l1_batch_number,
-            prepare_job(l1_batch_number, proof_job_ids, &*self.object_store)
+            prepare_job(l1_batch_number, recursion_tip_job_id, &*self.object_store)
                 .await
                 .context("prepare_job()")?,
         )))
@@ -141,7 +152,7 @@ impl JobProcessor for SchedulerWitnessGenerator {
 
     async fn save_failure(&self, job_id: L1BatchNumber, _started_at: Instant, error: String) -> () {
         self.prover_connection_pool
-            .access_storage()
+            .connection()
             .await
             .unwrap()
             .fri_witness_generator_dal()
@@ -152,10 +163,15 @@ impl JobProcessor for SchedulerWitnessGenerator {
     #[allow(clippy::async_yields_async)]
     async fn process_job(
         &self,
+        _job_id: &Self::JobId,
         job: SchedulerWitnessGeneratorJob,
         started_at: Instant,
     ) -> tokio::task::JoinHandle<anyhow::Result<SchedulerArtifacts>> {
-        tokio::task::spawn_blocking(move || Ok(Self::process_job_sync(job, started_at)))
+        tokio::task::spawn_blocking(move || {
+            let block_number = job.block_number;
+            let _span = tracing::info_span!("scheduler", %block_number).entered();
+            Ok(Self::process_job_sync(job, started_at))
+        })
     }
 
     async fn save_result(
@@ -175,13 +191,12 @@ impl JobProcessor for SchedulerWitnessGenerator {
         let scheduler_circuit_blob_url = self
             .object_store
             .put(key, &CircuitWrapper::Recursive(artifacts.scheduler_circuit))
-            .await
-            .unwrap();
+            .await?;
         WITNESS_GENERATOR_METRICS.blob_save_time[&AggregationRound::Scheduler.into()]
             .observe(blob_save_started_at.elapsed());
 
-        let mut prover_connection = self.prover_connection_pool.access_storage().await.unwrap();
-        let mut transaction = prover_connection.start_transaction().await.unwrap();
+        let mut prover_connection = self.prover_connection_pool.connection().await?;
+        let mut transaction = prover_connection.start_transaction().await?;
         let protocol_version_id = transaction
             .fri_witness_generator_dal()
             .protocol_version_for_l1_batch(job_id)
@@ -190,7 +205,7 @@ impl JobProcessor for SchedulerWitnessGenerator {
             .fri_prover_jobs_dal()
             .insert_prover_job(
                 job_id,
-                1,
+                ZkSyncRecursionLayerStorageType::SchedulerCircuit as u8,
                 0,
                 0,
                 AggregationRound::Scheduler,
@@ -205,7 +220,7 @@ impl JobProcessor for SchedulerWitnessGenerator {
             .mark_scheduler_job_as_successful(job_id, started_at.elapsed())
             .await;
 
-        transaction.commit().await.unwrap();
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -216,7 +231,7 @@ impl JobProcessor for SchedulerWitnessGenerator {
     async fn get_job_attempts(&self, job_id: &L1BatchNumber) -> anyhow::Result<u32> {
         let mut prover_storage = self
             .prover_connection_pool
-            .access_storage()
+            .connection()
             .await
             .context("failed to acquire DB connection for SchedulerWitnessGenerator")?;
         prover_storage
@@ -230,45 +245,44 @@ impl JobProcessor for SchedulerWitnessGenerator {
 
 pub async fn prepare_job(
     l1_batch_number: L1BatchNumber,
-    proof_job_ids: [u32; 13],
+    recursion_tip_job_id: u32,
     object_store: &dyn ObjectStore,
 ) -> anyhow::Result<SchedulerWitnessGeneratorJob> {
     let started_at = Instant::now();
-    let proofs = load_proofs_for_job_ids(&proof_job_ids, object_store).await;
+    let wrapper = object_store.get(recursion_tip_job_id).await?;
+    let recursion_tip_proof = match wrapper {
+        FriProofWrapper::Base(_) => Err(anyhow::anyhow!(
+            "Expected only recursive proofs for scheduler l1 batch {l1_batch_number}, got Base"
+        )),
+        FriProofWrapper::Recursive(recursive_proof) => Ok(recursive_proof.into_inner()),
+    }?;
     WITNESS_GENERATOR_METRICS.blob_fetch_time[&AggregationRound::Scheduler.into()]
         .observe(started_at.elapsed());
 
-    let mut recursive_proofs = vec![];
-    for wrapper in proofs {
-        match wrapper {
-            FriProofWrapper::Base(_) => anyhow::bail!(
-                "Expected only recursive proofs for scheduler l1 batch {l1_batch_number}"
-            ),
-            FriProofWrapper::Recursive(recursive_proof) => {
-                recursive_proofs.push(recursive_proof.into_inner())
-            }
-        }
-    }
-
     let started_at = Instant::now();
-    let node_vk = get_recursive_layer_vk_for_circuit_type(
-        ZkSyncRecursionLayerStorageType::NodeLayerCircuit as u8,
-    )
-    .context("get_recursive_layer_vk_for_circuit_type()")?;
+    let keystore = Keystore::default();
+    let node_vk = keystore
+        .load_recursive_layer_verification_key(
+            ZkSyncRecursionLayerStorageType::NodeLayerCircuit as u8,
+        )
+        .context("get_recursive_layer_vk_for_circuit_type()")?;
     let SchedulerPartialInputWrapper(mut scheduler_witness) =
-        object_store.get(l1_batch_number).await.unwrap();
-    scheduler_witness.node_layer_vk_witness = node_vk.clone().into_inner();
+        object_store.get(l1_batch_number).await?;
 
-    scheduler_witness.proof_witnesses = recursive_proofs.into();
+    let recursion_tip_vk = keystore
+        .load_recursive_layer_verification_key(
+            ZkSyncRecursionLayerStorageType::RecursionTipCircuit as u8,
+        )
+        .context("get_recursion_tip_vk()")?;
+    scheduler_witness.proof_witnesses = vec![recursion_tip_proof].into();
 
-    let leaf_vk_commits = get_leaf_vk_params().context("get_leaf_vk_params()")?;
-    let leaf_layer_params = leaf_vk_commits
+    let leaf_vk_commits = get_leaf_vk_params(&keystore).context("get_leaf_vk_params()")?;
+    let leaf_layer_parameters = leaf_vk_commits
         .iter()
         .map(|el| el.1.clone())
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
-    scheduler_witness.leaf_layer_parameters = leaf_layer_params;
 
     WITNESS_GENERATOR_METRICS.prepare_job_time[&AggregationRound::Scheduler.into()]
         .observe(started_at.elapsed());
@@ -277,5 +291,7 @@ pub async fn prepare_job(
         block_number: l1_batch_number,
         scheduler_witness,
         node_vk,
+        leaf_layer_parameters,
+        recursion_tip_vk,
     })
 }

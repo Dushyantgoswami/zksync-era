@@ -36,8 +36,8 @@ Here's the code that does the parsing: [TransactionRequest::from_bytes][transact
 ### Priority queue (L1 Tx only)
 
 L1 transactions are first 'packaged' and then sent to our Ethereum contract. After this, the L1 contract records this
-transaction in L1 logs. Our 'eth_watcher' constantly monitors these logs through the
-[`get_priority_op_events`][get_priority_op_events] method and then adds them to the database (mempool).
+transaction in L1 logs. [The `eth_watcher` component][eth_watcher] constantly monitors these logs and then adds them to
+the database (mempool).
 
 ### RPC & validation (L2 Tx only)
 
@@ -74,18 +74,16 @@ The transaction can have three different results in state keeper:
 - Success
 - Failure (but still included in the block, and gas was charged)
 - Rejection - when it fails validation, and cannot be included in the block. This last case should (in theory) never
-  happen - as we cannot charge the fee in such scenario, and it opens the possiblity for the DDoS attack.
+  happen - as we cannot charge the fee in such scenario, and it opens the possibility for the DDoS attack.
 
 [transaction_request_from_bytes]:
   https://github.com/matter-labs/zksync-era/blob/main/core/lib/types/src/transaction_request.rs#L196
   'transaction request from bytes'
-[get_priority_op_events]:
-  https://github.com/matter-labs/zksync-era/blob/main/core/lib/zksync_core/src/eth_watch/client.rs
-  'get priority op events'
+[eth_watcher]: https://github.com/matter-labs/zksync-era/blob/main/core/node/eth_watch 'Ethereum watcher component'
 [l1_tx]: https://github.com/matter-labs/zksync-era/blob/main/core/lib/types/src/l1/mod.rs#L183 'l1 tx'
 [l2_tx]: https://github.com/matter-labs/zksync-era/blob/main/core/lib/types/src/l2/mod.rs#L140 'l2 tx'
 [submit_tx]:
-  https://github.com/matter-labs/zksync-era/blob/main/core/lib/zksync_core/src/api_server/tx_sender/mod.rs#L309
+  https://github.com/matter-labs/zksync-era/blob/main/core/lib/zksync_core/src/api_server/tx_sender/mod.rs#L288
   'submit tx'
 [process_l1_batch]:
   https://github.com/matter-labs/zksync-era/blob/main/core/lib/zksync_core/src/state_keeper/keeper.rs#L257

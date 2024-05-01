@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use circuit_sequencer_api_1_3_3::sort_storage_access::sort_storage_access_queries;
 use zksync_state::{StoragePtr, WriteStorage};
 use zksync_types::{
     l2_to_l1_log::{L2ToL1Log, UserL2ToL1Log},
@@ -17,6 +18,7 @@ use crate::{
         L1BatchEnv, L2BlockEnv, SystemEnv, TxExecutionMode, VmExecutionMode,
         VmExecutionResultAndLogs, VmInterface, VmInterfaceHistoryEnabled, VmMemoryMetrics,
     },
+    tracers::old_tracers::TracerDispatcher,
     vm_1_3_2::{events::merge_events, VmInstance},
 };
 
@@ -29,8 +31,7 @@ pub struct Vm<S: WriteStorage, H: HistoryMode> {
 }
 
 impl<S: WriteStorage, H: HistoryMode> VmInterface<S, H> for Vm<S, H> {
-    /// Tracers are not supported for vm 1.3.2. So we use `()` as a placeholder
-    type TracerDispatcher = ();
+    type TracerDispatcher = TracerDispatcher;
 
     fn new(batch_env: L1BatchEnv, system_env: SystemEnv, storage: StoragePtr<S>) -> Self {
         let oracle_tools = crate::vm_1_3_2::OracleTools::new(storage.clone());
@@ -47,7 +48,7 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface<S, H> for Vm<S, H> {
                 block_properties,
                 system_env.execution_mode.glue_into(),
                 &system_env.base_system_smart_contracts.clone().glue_into(),
-                system_env.gas_limit,
+                system_env.bootloader_gas_limit,
             );
         Self {
             vm: inner_vm,
@@ -68,18 +69,31 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface<S, H> for Vm<S, H> {
 
     fn inspect(
         &mut self,
-        _tracer: Self::TracerDispatcher,
+        tracer: Self::TracerDispatcher,
         execution_mode: VmExecutionMode,
     ) -> VmExecutionResultAndLogs {
+        if let Some(storage_invocations) = tracer.storage_invocations {
+            self.vm
+                .execution_mode
+                .set_invocation_limit(storage_invocations);
+        }
+
         match execution_mode {
             VmExecutionMode::OneTx => {
                 match self.system_env.execution_mode {
                     TxExecutionMode::VerifyExecute => {
-                        // Even that call tracer is supported here, we don't use it now 
-                        self.vm.execute_next_tx(
+                        let enable_call_tracer = tracer
+                            .call_tracer.is_some();
+                        let result = self.vm.execute_next_tx(
                             self.system_env.default_validation_computational_gas_limit,
-                            false,
-                        ).glue_into()
+                            enable_call_tracer,
+                        );
+                        if let (Ok(result), Some(call_tracer)) = (&result, &tracer.call_tracer) {
+                            call_tracer.set( result.call_traces.clone()).unwrap();
+
+                        }
+                        result.glue_into()
+
                     }
                     TxExecutionMode::EstimateFee | TxExecutionMode::EthCall => self.vm
                         .execute_till_block_end(
@@ -143,9 +157,17 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface<S, H> for Vm<S, H> {
             .cloned()
             .collect();
 
+        let storage_log_queries = self.vm.state.storage.get_final_log_queries();
+
+        let deduped_storage_log_queries =
+            sort_storage_access_queries(storage_log_queries.iter().map(|log| &log.log_query)).1;
+
         CurrentExecutionState {
             events,
-            storage_log_queries: self.vm.state.storage.get_final_log_queries(),
+            deduplicated_storage_log_queries: deduped_storage_log_queries
+                .into_iter()
+                .map(GlueInto::glue_into)
+                .collect(),
             used_contract_hashes,
             user_l2_to_l1_logs: l2_to_l1_logs,
             system_logs: vec![],
@@ -154,15 +176,24 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface<S, H> for Vm<S, H> {
             // It's not applicable for vm 1.3.2
             deduplicated_events_logs: vec![],
             storage_refunds: vec![],
+            pubdata_costs: Vec::new(),
         }
     }
 
     fn inspect_transaction_with_bytecode_compression(
         &mut self,
-        _tracer: Self::TracerDispatcher,
+        tracer: Self::TracerDispatcher,
         tx: Transaction,
         with_compression: bool,
-    ) -> Result<VmExecutionResultAndLogs, BytecodeCompressionError> {
+    ) -> (
+        Result<(), BytecodeCompressionError>,
+        VmExecutionResultAndLogs,
+    ) {
+        if let Some(storage_invocations) = tracer.storage_invocations {
+            self.vm
+                .execution_mode
+                .set_invocation_limit(storage_invocations);
+        }
         self.last_tx_compressed_bytecodes = vec![];
         let bytecodes = if with_compression {
             let deps = tx.execute.factory_deps.as_deref().unwrap_or_default();
@@ -201,17 +232,35 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface<S, H> for Vm<S, H> {
         };
 
         // Even that call tracer is supported here, we don't use it.
-        let result = self.vm.execute_next_tx(
-            self.system_env.default_validation_computational_gas_limit,
-            false,
-        );
+        let result = match self.system_env.execution_mode {
+            TxExecutionMode::VerifyExecute => {
+                let enable_call_tracer = tracer.call_tracer.is_some();
+                let result = self.vm.execute_next_tx(
+                    self.system_env.default_validation_computational_gas_limit,
+                    enable_call_tracer,
+                );
+                if let (Ok(result), Some(call_tracer)) = (&result, &tracer.call_tracer) {
+                    call_tracer.set(result.call_traces.clone()).unwrap();
+                }
+                result.glue_into()
+            }
+            TxExecutionMode::EstimateFee | TxExecutionMode::EthCall => self
+                .vm
+                .execute_till_block_end(
+                    crate::vm_1_3_2::vm_with_bootloader::BootloaderJobType::TransactionExecution,
+                )
+                .glue_into(),
+        };
         if bytecodes
             .iter()
             .any(|info| !self.vm.is_bytecode_known(info))
         {
-            Err(crate::interface::BytecodeCompressionError::BytecodeCompressionFailed)
+            (
+                Err(BytecodeCompressionError::BytecodeCompressionFailed),
+                result,
+            )
         } else {
-            Ok(result.glue_into())
+            (Ok(()), result)
         }
     }
 
@@ -230,6 +279,10 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface<S, H> for Vm<S, H> {
             storage_inner: self.vm.state.storage.get_size(),
             storage_history: self.vm.state.storage.get_history_size(),
         }
+    }
+
+    fn gas_remaining(&self) -> u32 {
+        self.vm.gas_remaining()
     }
 
     fn finish_batch(&mut self) -> FinishedL1Batch {

@@ -60,9 +60,8 @@ fn test_predetermined_refunded_gas() {
         .build();
 
     let tx: TransactionData = tx.into();
-    let block_gas_per_pubdata_byte = vm.vm.batch_env.block_gas_price_per_pubdata();
     // Overhead
-    let overhead = tx.overhead_gas(block_gas_per_pubdata_byte as u32);
+    let overhead = tx.overhead_gas();
     vm.vm
         .push_raw_transaction(tx.clone(), overhead, result.refunds.gas_refunded, true);
 
@@ -95,8 +94,8 @@ fn test_predetermined_refunded_gas() {
     );
 
     assert_eq!(
-        current_state_with_predefined_refunds.storage_log_queries,
-        current_state_without_predefined_refunds.storage_log_queries
+        current_state_with_predefined_refunds.deduplicated_storage_log_queries,
+        current_state_without_predefined_refunds.deduplicated_storage_log_queries
     );
     assert_eq!(
         current_state_with_predefined_refunds.used_contract_hashes,
@@ -149,16 +148,16 @@ fn test_predetermined_refunded_gas() {
 
     assert_eq!(
         current_state_with_changed_predefined_refunds
-            .storage_log_queries
+            .deduplicated_storage_log_queries
             .len(),
         current_state_without_predefined_refunds
-            .storage_log_queries
+            .deduplicated_storage_log_queries
             .len()
     );
 
     assert_ne!(
-        current_state_with_changed_predefined_refunds.storage_log_queries,
-        current_state_without_predefined_refunds.storage_log_queries
+        current_state_with_changed_predefined_refunds.deduplicated_storage_log_queries,
+        current_state_without_predefined_refunds.deduplicated_storage_log_queries
     );
     assert_eq!(
         current_state_with_changed_predefined_refunds.used_contract_hashes,

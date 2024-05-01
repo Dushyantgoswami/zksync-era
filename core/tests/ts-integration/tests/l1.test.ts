@@ -6,10 +6,15 @@
  * and waiting for the block finalization).
  */
 import { TestMaster } from '../src/index';
-import * as zksync from 'zksync-web3';
+import * as zksync from 'zksync-ethers';
 import * as ethers from 'ethers';
 import { deployContract, getTestContract, scaledGasPrice, waitForNewL1Batch } from '../src/helpers';
-import { getHashedL2ToL1Msg, L1_MESSENGER, L1_MESSENGER_ADDRESS } from 'zksync-web3/build/src/utils';
+import {
+    getHashedL2ToL1Msg,
+    L1_MESSENGER,
+    L1_MESSENGER_ADDRESS,
+    REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_LIMIT
+} from 'zksync-ethers/build/src/utils';
 
 const SYSTEM_CONFIG = require(`${process.env.ZKSYNC_HOME}/contracts/SystemConfig.json`);
 
@@ -31,6 +36,9 @@ describe('Tests for L1 behavior', () => {
     let contextContract: zksync.Contract;
     let errorContract: zksync.Contract;
 
+    let isETHBasedChain: boolean;
+    let expectedL2Costs: ethers.BigNumberish;
+
     beforeAll(() => {
         testMaster = TestMaster.getInstance(__filename);
         alice = testMaster.mainAccount();
@@ -44,6 +52,31 @@ describe('Tests for L1 behavior', () => {
         errorContract = await deployContract(alice, contracts.errors, []);
     });
 
+    test('Should provide allowance to shared bridge, if base token is not ETH', async () => {
+        const baseTokenAddress = process.env.CONTRACTS_BASE_TOKEN_ADDR!;
+        isETHBasedChain = baseTokenAddress == zksync.utils.ETH_ADDRESS_IN_CONTRACTS;
+        if (!isETHBasedChain) {
+            const baseTokenDetails = testMaster.environment().baseToken;
+            const maxAmount = await alice.getBalanceL1(baseTokenDetails.l1Address);
+            await (await alice.approveERC20(baseTokenDetails.l1Address, maxAmount)).wait();
+        }
+    });
+
+    test('Should calculate l2 base cost, if base token is not ETH', async () => {
+        const gasPrice = await scaledGasPrice(alice);
+        if (!isETHBasedChain) {
+            expectedL2Costs = (
+                await alice.getBaseCost({
+                    gasLimit: maxL2GasLimitForPriorityTxs(),
+                    gasPerPubdataByte: REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_LIMIT,
+                    gasPrice
+                })
+            )
+                .mul(140)
+                .div(100);
+        }
+    });
+
     test('Should request L1 execute', async () => {
         const calldata = counterContract.interface.encodeFunctionData('increment', ['1']);
         const gasPrice = scaledGasPrice(alice);
@@ -52,6 +85,7 @@ describe('Tests for L1 behavior', () => {
             alice.requestExecute({
                 contractAddress: counterContract.address,
                 calldata,
+                mintValue: isETHBasedChain ? ethers.BigNumber.from(0) : expectedL2Costs,
                 overrides: {
                     gasPrice
                 }
@@ -69,6 +103,7 @@ describe('Tests for L1 behavior', () => {
                 contractAddress: contextContract.address,
                 calldata,
                 l2Value,
+                mintValue: isETHBasedChain ? ethers.BigNumber.from(0) : expectedL2Costs,
                 overrides: {
                     gasPrice
                 }
@@ -85,6 +120,7 @@ describe('Tests for L1 behavior', () => {
                 contractAddress: errorContract.address,
                 calldata,
                 l2GasLimit: DEFAULT_L2_GAS_LIMIT,
+                mintValue: isETHBasedChain ? ethers.BigNumber.from(0) : expectedL2Costs,
                 overrides: {
                     gasPrice
                 }
@@ -116,12 +152,12 @@ describe('Tests for L1 behavior', () => {
         expect(accumutatedRoot).toBe(root);
 
         // Ensure that provided proof is accepted by the main zkSync contract.
-        const zkSyncContract = await alice.getMainContract();
-        const acceptedByContract = await zkSyncContract.proveL2MessageInclusion(
+        const chainContract = await alice.getMainContract();
+        const acceptedByContract = await chainContract.proveL2MessageInclusion(
             receipt.l1BatchNumber,
             id,
             {
-                txNumberInBlock: receipt.l1BatchTxIndex,
+                txNumberInBatch: receipt.l1BatchTxIndex,
                 sender: alice.address,
                 data: message
             },
@@ -132,7 +168,6 @@ describe('Tests for L1 behavior', () => {
 
     test('Should check max L2 gas limit for priority txs', async () => {
         const gasPrice = scaledGasPrice(alice);
-
         const l2GasLimit = maxL2GasLimitForPriorityTxs();
 
         // Check that the request with higher `gasLimit` fails.
@@ -140,6 +175,7 @@ describe('Tests for L1 behavior', () => {
             contractAddress: alice.address,
             calldata: '0x',
             l2GasLimit: l2GasLimit + 1,
+            mintValue: isETHBasedChain ? ethers.BigNumber.from(0) : expectedL2Costs,
             overrides: {
                 gasPrice,
                 gasLimit: 600_000
@@ -158,6 +194,7 @@ describe('Tests for L1 behavior', () => {
             contractAddress: alice.address,
             calldata: '0x',
             l2GasLimit,
+            mintValue: isETHBasedChain ? ethers.BigNumber.from(0) : expectedL2Costs,
             overrides: {
                 gasPrice
             }
@@ -173,6 +210,7 @@ describe('Tests for L1 behavior', () => {
         }
 
         const contract = await deployContract(alice, contracts.writesAndMessages, []);
+        testMaster.reporter.debug(`Deployed 'writesAndMessages' contract at ${contract.address}`);
         // The circuit allows us to have ~4700 initial writes for an L1 batch.
         // We check that we will run out of gas if we do a bit smaller amount of writes.
         const calldata = contract.interface.encodeFunctionData('writes', [0, 4500, 1]);
@@ -184,12 +222,17 @@ describe('Tests for L1 behavior', () => {
             contractAddress: contract.address,
             calldata,
             l2GasLimit,
+            mintValue: isETHBasedChain ? ethers.BigNumber.from(0) : expectedL2Costs,
             overrides: {
                 gasPrice
             }
         });
+        testMaster.reporter.debug(
+            `Requested priority execution of transaction with big message: ${priorityOpHandle.hash}`
+        );
         // The request should be accepted on L1.
         await priorityOpHandle.waitL1Commit();
+        testMaster.reporter.debug(`Request ${priorityOpHandle.hash} is accepted on L1`);
         // The L2 tx should revert.
         await expect(priorityOpHandle).toBeReverted();
     });
@@ -202,6 +245,7 @@ describe('Tests for L1 behavior', () => {
         }
 
         const contract = await deployContract(alice, contracts.writesAndMessages, []);
+        testMaster.reporter.debug(`Deployed 'writesAndMessages' contract at ${contract.address}`);
         // The circuit allows us to have ~7500 repeated writes for an L1 batch.
         // We check that we will run out of gas if we do a bit smaller amount of writes.
         // In order for writes to be repeated we should firstly write to the keys initially.
@@ -211,32 +255,39 @@ describe('Tests for L1 behavior', () => {
 
         let proms = [];
         const nonce = await alice.getNonce();
+        testMaster.reporter.debug(`Obtained nonce: ${nonce}`);
         for (let i = 0; i < repeatedWritesInOneTx / initialWritesInOneTx; ++i) {
             proms.push(
                 contract.writes(i * initialWritesInOneTx, initialWritesInOneTx, 1, { gasLimit, nonce: nonce + i })
             );
         }
         const handles = await Promise.all(proms);
+        testMaster.reporter.debug(`Sent ${handles.length} L2 transactions with writes`);
         for (const handle of handles) {
             await handle.wait();
         }
         await waitForNewL1Batch(alice);
+        testMaster.reporter.debug('L1 batch sealed with write transactions');
 
         const calldata = contract.interface.encodeFunctionData('writes', [0, repeatedWritesInOneTx, 2]);
         const gasPrice = scaledGasPrice(alice);
-
         const l2GasLimit = maxL2GasLimitForPriorityTxs();
 
         const priorityOpHandle = await alice.requestExecute({
             contractAddress: contract.address,
             calldata,
             l2GasLimit,
+            mintValue: isETHBasedChain ? ethers.BigNumber.from(0) : expectedL2Costs,
             overrides: {
                 gasPrice
             }
         });
+        testMaster.reporter.debug(
+            `Requested priority execution of transaction with repeated storage writes on L1: ${priorityOpHandle.hash}`
+        );
         // The request should be accepted on L1.
         await priorityOpHandle.waitL1Commit();
+        testMaster.reporter.debug(`Request ${priorityOpHandle.hash} is accepted on L1`);
         // The L2 tx should revert.
         await expect(priorityOpHandle).toBeReverted();
     });
@@ -249,6 +300,7 @@ describe('Tests for L1 behavior', () => {
         }
 
         const contract = await deployContract(alice, contracts.writesAndMessages, []);
+        testMaster.reporter.debug(`Deployed 'writesAndMessages' contract at ${contract.address}`);
         // The circuit allows us to have 512 L2->L1 logs for an L1 batch.
         // We check that we will run out of gas if we send a bit smaller amount of L2->L1 logs.
         const calldata = contract.interface.encodeFunctionData('l2_l1_messages', [1000]);
@@ -260,12 +312,17 @@ describe('Tests for L1 behavior', () => {
             contractAddress: contract.address,
             calldata,
             l2GasLimit,
+            mintValue: isETHBasedChain ? ethers.BigNumber.from(0) : expectedL2Costs,
             overrides: {
                 gasPrice
             }
         });
+        testMaster.reporter.debug(
+            `Requested priority execution of transaction with big message: ${priorityOpHandle.hash}`
+        );
         // The request should be accepted on L1.
         await priorityOpHandle.waitL1Commit();
+        testMaster.reporter.debug(`Request ${priorityOpHandle.hash} is accepted on L1`);
         // The L2 tx should revert.
         await expect(priorityOpHandle).toBeReverted();
     });
@@ -278,7 +335,8 @@ describe('Tests for L1 behavior', () => {
         }
 
         const contract = await deployContract(alice, contracts.writesAndMessages, []);
-        const MAX_PUBDATA_PER_BATCH = ethers.BigNumber.from(SYSTEM_CONFIG['MAX_PUBDATA_PER_BATCH']);
+        testMaster.reporter.debug(`Deployed 'writesAndMessages' contract at ${contract.address}`);
+        const MAX_PUBDATA_PER_BATCH = ethers.BigNumber.from(SYSTEM_CONFIG['PRIORITY_TX_PUBDATA_PER_BATCH']);
         // We check that we will run out of gas if we send a bit
         // smaller than `MAX_PUBDATA_PER_BATCH` amount of pubdata in a single tx.
         const calldata = contract.interface.encodeFunctionData('big_l2_l1_message', [
@@ -292,12 +350,17 @@ describe('Tests for L1 behavior', () => {
             contractAddress: contract.address,
             calldata,
             l2GasLimit,
+            mintValue: isETHBasedChain ? ethers.BigNumber.from(0) : expectedL2Costs,
             overrides: {
                 gasPrice
             }
         });
+        testMaster.reporter.debug(
+            `Requested priority execution of transaction with big message: ${priorityOpHandle.hash}`
+        );
         // The request should be accepted on L1.
         await priorityOpHandle.waitL1Commit();
+        testMaster.reporter.debug(`Request ${priorityOpHandle.hash} is accepted on L1`);
         // The L2 tx should revert.
         await expect(priorityOpHandle).toBeReverted();
     });
@@ -338,60 +401,16 @@ function maxL2GasLimitForPriorityTxs(): number {
     let maxGasBodyLimit = +process.env.CONTRACTS_PRIORITY_TX_MAX_GAS_LIMIT!;
 
     const overhead = getOverheadForTransaction(
-        ethers.BigNumber.from(maxGasBodyLimit),
-        ethers.BigNumber.from(zksync.utils.REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_LIMIT),
-        // We can just pass 0 as `encodingLength` because `overheadForPublicData` and `overheadForGas`
-        // will be greater than `overheadForLength` for large `gasLimit`.
+        // We can just pass 0 as `encodingLength` because the overhead for the transaction's slot
+        // will be greater than `overheadForLength` for a typical transacction
         ethers.BigNumber.from(0)
     );
     return maxGasBodyLimit + overhead;
 }
 
-function getOverheadForTransaction(
-    bodyGasLimit: ethers.BigNumber,
-    gasPricePerPubdata: ethers.BigNumber,
-    encodingLength: ethers.BigNumber
-): number {
-    const BATCH_OVERHEAD_L2_GAS = ethers.BigNumber.from(SYSTEM_CONFIG['BATCH_OVERHEAD_L2_GAS']);
-    const L1_GAS_PER_PUBDATA_BYTE = ethers.BigNumber.from(SYSTEM_CONFIG['L1_GAS_PER_PUBDATA_BYTE']);
-    const BATCH_OVERHEAD_L1_GAS = ethers.BigNumber.from(SYSTEM_CONFIG['BATCH_OVERHEAD_L1_GAS']);
-    const BATCH_OVERHEAD_PUBDATA = BATCH_OVERHEAD_L1_GAS.div(L1_GAS_PER_PUBDATA_BYTE);
+function getOverheadForTransaction(encodingLength: ethers.BigNumber): number {
+    const TX_SLOT_OVERHEAD_GAS = 10_000;
+    const TX_LENGTH_BYTE_OVERHEAD_GAS = 10;
 
-    const MAX_TRANSACTIONS_IN_BATCH = ethers.BigNumber.from(SYSTEM_CONFIG['MAX_TRANSACTIONS_IN_BATCH']);
-    const BOOTLOADER_TX_ENCODING_SPACE = ethers.BigNumber.from(SYSTEM_CONFIG['BOOTLOADER_TX_ENCODING_SPACE']);
-    // TODO (EVM-67): possibly charge overhead for pubdata
-    // const MAX_PUBDATA_PER_BATCH = ethers.BigNumber.from(SYSTEM_CONFIG['MAX_PUBDATA_PER_BATCH']);
-    const L2_TX_MAX_GAS_LIMIT = ethers.BigNumber.from(SYSTEM_CONFIG['L2_TX_MAX_GAS_LIMIT']);
-
-    const maxBlockOverhead = BATCH_OVERHEAD_L2_GAS.add(BATCH_OVERHEAD_PUBDATA.mul(gasPricePerPubdata));
-
-    // The overhead from taking up the transaction's slot
-    const txSlotOverhead = ceilDiv(maxBlockOverhead, MAX_TRANSACTIONS_IN_BATCH);
-    let blockOverheadForTransaction = txSlotOverhead;
-
-    // The overhead for occupying the bootloader memory can be derived from encoded_len
-    const overheadForLength = ceilDiv(encodingLength.mul(maxBlockOverhead), BOOTLOADER_TX_ENCODING_SPACE);
-    if (overheadForLength.gt(blockOverheadForTransaction)) {
-        blockOverheadForTransaction = overheadForLength;
-    }
-
-    // The overhead for possible published public data
-    // TODO (EVM-67): possibly charge overhead for pubdata
-    // let maxPubdataInTx = ceilDiv(bodyGasLimit, gasPricePerPubdata);
-    // let overheadForPublicData = ceilDiv(maxPubdataInTx.mul(maxBlockOverhead), MAX_PUBDATA_PER_BATCH);
-    // if (overheadForPublicData.gt(blockOverheadForTransaction)) {
-    //     blockOverheadForTransaction = overheadForPublicData;
-    // }
-
-    // The overhead for gas that could be used to use single-instance circuits
-    let overheadForSingleInstanceCircuits = ceilDiv(bodyGasLimit.mul(maxBlockOverhead), L2_TX_MAX_GAS_LIMIT);
-    if (overheadForSingleInstanceCircuits.gt(blockOverheadForTransaction)) {
-        blockOverheadForTransaction = overheadForSingleInstanceCircuits;
-    }
-
-    return blockOverheadForTransaction.toNumber();
-}
-
-function ceilDiv(a: ethers.BigNumber, b: ethers.BigNumber): ethers.BigNumber {
-    return a.add(b.sub(1)).div(b);
+    return Math.max(TX_SLOT_OVERHEAD_GAS, TX_LENGTH_BYTE_OVERHEAD_GAS * encodingLength.toNumber());
 }

@@ -4,18 +4,24 @@ use once_cell::sync::OnceCell;
 use zksync_state::{StoragePtr, WriteStorage};
 use zksync_system_constants::{
     ACCOUNT_CODE_STORAGE_ADDRESS, BOOTLOADER_ADDRESS, CONTRACT_DEPLOYER_ADDRESS,
-    L2_ETH_TOKEN_ADDRESS, MSG_VALUE_SIMULATOR_ADDRESS, SYSTEM_CONTEXT_ADDRESS,
+    L2_BASE_TOKEN_ADDRESS, MSG_VALUE_SIMULATOR_ADDRESS, SYSTEM_CONTEXT_ADDRESS,
 };
 use zksync_types::{
     vm_trace::ViolatedValidationRule, web3::signing::keccak256, AccountTreeId, Address, StorageKey,
-    H256, U256,
+    VmVersion, H256, U256,
 };
 use zksync_utils::{be_bytes_to_safe_address, u256_to_account_address, u256_to_h256};
 
-use crate::tracers::validator::types::{NewTrustedValidationItems, ValidationTracerMode};
 pub use crate::tracers::validator::types::{ValidationError, ValidationTracerParams};
+use crate::{
+    glue::tracers::IntoOldVmTracer,
+    tracers::validator::types::{NewTrustedValidationItems, ValidationTracerMode},
+};
 
 mod types;
+mod vm_1_4_1;
+mod vm_1_4_2;
+mod vm_boojum_integration;
 mod vm_latest;
 mod vm_refunds_enhancement;
 mod vm_virtual_blocks;
@@ -36,6 +42,7 @@ pub struct ValidationTracer<H> {
     trusted_address_slots: HashSet<(Address, U256)>,
     computational_gas_used: u32,
     computational_gas_limit: u32,
+    vm_version: VmVersion,
     pub result: Arc<OnceCell<ViolatedValidationRule>>,
     _marker: PhantomData<fn(H) -> H>,
 }
@@ -43,7 +50,10 @@ pub struct ValidationTracer<H> {
 type ValidationRoundResult = Result<NewTrustedValidationItems, ViolatedValidationRule>;
 
 impl<H> ValidationTracer<H> {
-    pub fn new(params: ValidationTracerParams) -> (Self, Arc<OnceCell<ViolatedValidationRule>>) {
+    pub fn new(
+        params: ValidationTracerParams,
+        vm_version: VmVersion,
+    ) -> (Self, Arc<OnceCell<ViolatedValidationRule>>) {
         let result = Arc::new(OnceCell::new());
         (
             Self {
@@ -58,6 +68,7 @@ impl<H> ValidationTracer<H> {
                 trusted_address_slots: params.trusted_address_slots,
                 computational_gas_used: 0,
                 computational_gas_limit: params.computational_gas_limit,
+                vm_version,
                 result: result.clone(),
                 _marker: Default::default(),
             },
@@ -101,7 +112,7 @@ impl<H> ValidationTracer<H> {
             return true;
         }
 
-        // The pair of MSG_VALUE_SIMULATOR_ADDRESS & L2_ETH_TOKEN_ADDRESS simulates the behavior of transferring ETH
+        // The pair of `MSG_VALUE_SIMULATOR_ADDRESS` & `L2_ETH_TOKEN_ADDRESS` simulates the behavior of transferring ETH
         // that is safe for the DDoS protection rules.
         if valid_eth_token_call(address, msg_sender) {
             return true;
@@ -145,11 +156,11 @@ impl<H> ValidationTracer<H> {
         let (potential_address_bytes, potential_position_bytes) = calldata.split_at(32);
         let potential_address = be_bytes_to_safe_address(potential_address_bytes);
 
-        // If the validation_address is equal to the potential_address,
-        // then it is a request that could be used for mapping of kind mapping(address => ...).
+        // If the `validation_address` is equal to the `potential_address`,
+        // then it is a request that could be used for mapping of kind `mapping(address => ...).`
         //
-        // If the potential_position_bytes were already allowed before, then this keccak might be used
-        // for ERC-20 allowance or any other of mapping(address => mapping(...))
+        // If the `potential_position_bytes` were already allowed before, then this keccak might be used
+        // for ERC-20 allowance or any other of `mapping(address => mapping(...))`
         if potential_address == Some(validated_address)
             || self
                 .auxilary_allowed_slots
@@ -187,7 +198,7 @@ fn touches_allowed_context(address: Address, key: U256) -> bool {
         return false;
     }
 
-    // Only chain_id is allowed to be touched.
+    // Only `chain_id` is allowed to be touched.
     key == U256::from(0u32)
 }
 
@@ -213,5 +224,7 @@ fn valid_eth_token_call(address: Address, msg_sender: Address) -> bool {
     let is_valid_caller = msg_sender == MSG_VALUE_SIMULATOR_ADDRESS
         || msg_sender == CONTRACT_DEPLOYER_ADDRESS
         || msg_sender == BOOTLOADER_ADDRESS;
-    address == L2_ETH_TOKEN_ADDRESS && is_valid_caller
+    address == L2_BASE_TOKEN_ADDRESS && is_valid_caller
 }
+
+impl<H> IntoOldVmTracer for ValidationTracer<H> {}

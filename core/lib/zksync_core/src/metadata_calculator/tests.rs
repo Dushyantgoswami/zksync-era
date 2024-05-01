@@ -1,27 +1,32 @@
-use std::{future::Future, ops, panic, path::Path, time::Duration};
+//! Tests for the metadata calculator component life cycle.
+
+use std::{future::Future, ops, panic, path::Path, sync::Arc, time::Duration};
 
 use assert_matches::assert_matches;
 use itertools::Itertools;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, watch};
-use zksync_config::configs::{chain::OperationsManagerConfig, database::MerkleTreeConfig};
-use zksync_contracts::BaseSystemContracts;
-use zksync_dal::{ConnectionPool, StorageProcessor};
+use zksync_config::configs::{
+    chain::OperationsManagerConfig,
+    database::{MerkleTreeConfig, MerkleTreeMode},
+};
+use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_health_check::{CheckHealth, HealthStatus};
 use zksync_merkle_tree::domain::ZkSyncTree;
 use zksync_object_store::{ObjectStore, ObjectStoreFactory};
+use zksync_prover_interface::inputs::PrepareBasicCircuitsJob;
+use zksync_storage::RocksDB;
 use zksync_types::{
-    block::{BlockGasCount, L1BatchHeader, MiniblockHasher, MiniblockHeader},
-    proofs::PrepareBasicCircuitsJob,
-    AccountTreeId, Address, L1BatchNumber, L2ChainId, MiniblockNumber, ProtocolVersionId,
-    StorageKey, StorageLog, H256,
+    block::L1BatchHeader, AccountTreeId, Address, L1BatchNumber, L2BlockNumber, StorageKey,
+    StorageLog, H256,
 };
 use zksync_utils::u32_to_h256;
 
-use super::{
-    L1BatchWithLogs, MetadataCalculator, MetadataCalculatorConfig, MetadataCalculatorModeConfig,
+use super::{GenericAsyncTree, L1BatchWithLogs, MetadataCalculator, MetadataCalculatorConfig};
+use crate::{
+    genesis::{insert_genesis_batch, GenesisParams},
+    utils::testonly::{create_l1_batch, create_l2_block},
 };
-use crate::genesis::{ensure_genesis_state, GenesisParams};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -36,31 +41,46 @@ where
     }
 }
 
-#[tokio::test]
-async fn genesis_creation() {
-    let pool = ConnectionPool::test_pool().await;
-    let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-
-    let (calculator, _) = setup_calculator(temp_dir.path(), &pool).await;
-    run_calculator(calculator, pool.clone()).await;
-    let (calculator, _) = setup_calculator(temp_dir.path(), &pool).await;
-    assert_eq!(
-        calculator.updater.tree().next_l1_batch_number(),
-        L1BatchNumber(1)
-    );
+pub(super) fn mock_config(db_path: &Path) -> MetadataCalculatorConfig {
+    MetadataCalculatorConfig {
+        db_path: db_path.to_str().unwrap().to_owned(),
+        max_open_files: None,
+        mode: MerkleTreeMode::Full,
+        delay_interval: Duration::from_millis(100),
+        max_l1_batches_per_iter: 10,
+        multi_get_chunk_size: 500,
+        block_cache_capacity: 0,
+        include_indices_and_filters_in_block_cache: false,
+        memtable_capacity: 16 << 20,            // 16 MiB
+        stalled_writes_timeout: Duration::ZERO, // writes should never be stalled in tests
+    }
 }
 
-// TODO (SMA-1726): Restore tests for tree backup mode
+#[tokio::test]
+async fn genesis_creation() {
+    let pool = ConnectionPool::<Core>::test_pool().await;
+    let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
+
+    let (calculator, _) = setup_calculator(temp_dir.path(), pool.clone()).await;
+    run_calculator(calculator).await;
+    let (calculator, _) = setup_calculator(temp_dir.path(), pool).await;
+
+    let tree = calculator.create_tree().await.unwrap();
+    let GenericAsyncTree::Ready(tree) = tree else {
+        panic!("Unexpected tree state: {tree:?}");
+    };
+    assert_eq!(tree.next_l1_batch_number(), L1BatchNumber(1));
+}
 
 #[tokio::test]
 async fn basic_workflow() {
-    let pool = ConnectionPool::test_pool().await;
+    let pool = ConnectionPool::<Core>::test_pool().await;
 
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
 
-    let (calculator, object_store) = setup_calculator(temp_dir.path(), &pool).await;
+    let (calculator, object_store) = setup_calculator(temp_dir.path(), pool.clone()).await;
     reset_db_state(&pool, 1).await;
-    let merkle_tree_hash = run_calculator(calculator, pool.clone()).await;
+    let merkle_tree_hash = run_calculator(calculator).await;
 
     // Check the hash against the reference.
     let expected_tree_hash = expected_tree_hash(&pool).await;
@@ -73,25 +93,29 @@ async fn basic_workflow() {
     // ^ The exact values depend on ops in genesis block
     assert!(merkle_paths.iter().all(|log| log.is_write));
 
-    let (calculator, _) = setup_calculator(temp_dir.path(), &pool).await;
-    assert_eq!(
-        calculator.updater.tree().next_l1_batch_number(),
-        L1BatchNumber(2)
-    );
+    let (calculator, _) = setup_calculator(temp_dir.path(), pool).await;
+    let tree = calculator.create_tree().await.unwrap();
+    let GenericAsyncTree::Ready(tree) = tree else {
+        panic!("Unexpected tree state: {tree:?}");
+    };
+    assert_eq!(tree.next_l1_batch_number(), L1BatchNumber(2));
 }
 
-async fn expected_tree_hash(pool: &ConnectionPool) -> H256 {
-    let mut storage = pool.access_storage().await.unwrap();
+async fn expected_tree_hash(pool: &ConnectionPool<Core>) -> H256 {
+    let mut storage = pool.connection().await.unwrap();
     let sealed_l1_batch_number = storage
         .blocks_dal()
         .get_sealed_l1_batch_number()
         .await
         .unwrap()
-        .0;
+        .expect("No L1 batches in Postgres");
     let mut all_logs = vec![];
-    for i in 0..=sealed_l1_batch_number {
-        let logs = L1BatchWithLogs::new(&mut storage, L1BatchNumber(i)).await;
-        let logs = logs.unwrap().storage_logs;
+    for i in 0..=sealed_l1_batch_number.0 {
+        let logs =
+            L1BatchWithLogs::new(&mut storage, L1BatchNumber(i), MerkleTreeMode::Lightweight)
+                .await
+                .unwrap();
+        let logs = logs.expect("no L1 batch").storage_logs;
         all_logs.extend(logs);
     }
     ZkSyncTree::process_genesis_batch(&all_logs).root_hash
@@ -99,10 +123,10 @@ async fn expected_tree_hash(pool: &ConnectionPool) -> H256 {
 
 #[tokio::test]
 async fn status_receiver_has_correct_states() {
-    let pool = ConnectionPool::test_pool().await;
+    let pool = ConnectionPool::<Core>::test_pool().await;
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
 
-    let (mut calculator, _) = setup_calculator(temp_dir.path(), &pool).await;
+    let (mut calculator, _) = setup_calculator(temp_dir.path(), pool.clone()).await;
     let tree_health_check = calculator.tree_health_check();
     assert_eq!(tree_health_check.name(), "tree");
     let health = tree_health_check.check_health().await;
@@ -118,7 +142,7 @@ async fn status_receiver_has_correct_states() {
     let (delay_sx, mut delay_rx) = mpsc::unbounded_channel();
     calculator.delayer.delay_notifier = delay_sx;
 
-    let calculator_handle = tokio::spawn(calculator.run(pool, stop_rx));
+    let calculator_handle = tokio::spawn(calculator.run(stop_rx));
     delay_rx.recv().await.unwrap();
     assert_eq!(
         tree_health_check.check_health().await.status(),
@@ -143,23 +167,28 @@ async fn status_receiver_has_correct_states() {
         other_tree_health_check.check_health().await.status(),
         HealthStatus::ShutDown
     );
+
+    // Check that health checks don't prevent dropping RocksDB instances.
+    tokio::task::spawn_blocking(RocksDB::await_rocksdb_termination)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn multi_l1_batch_workflow() {
-    let pool = ConnectionPool::test_pool().await;
+    let pool = ConnectionPool::<Core>::test_pool().await;
 
     // Collect all storage logs in a single L1 batch
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-    let (calculator, _) = setup_calculator(temp_dir.path(), &pool).await;
+    let (calculator, _) = setup_calculator(temp_dir.path(), pool.clone()).await;
     reset_db_state(&pool, 1).await;
-    let root_hash = run_calculator(calculator, pool.clone()).await;
+    let root_hash = run_calculator(calculator).await;
 
     // Collect the same logs in multiple L1 batches
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-    let (calculator, object_store) = setup_calculator(temp_dir.path(), &pool).await;
+    let (calculator, object_store) = setup_calculator(temp_dir.path(), pool.clone()).await;
     reset_db_state(&pool, 10).await;
-    let multi_block_root_hash = run_calculator(calculator, pool).await;
+    let multi_block_root_hash = run_calculator(calculator).await;
     assert_eq!(multi_block_root_hash, root_hash);
 
     let mut prev_index = None;
@@ -183,19 +212,19 @@ async fn multi_l1_batch_workflow() {
 
 #[tokio::test]
 async fn running_metadata_calculator_with_additional_blocks() {
-    let pool = ConnectionPool::test_pool().await;
+    let pool = ConnectionPool::<Core>::test_pool().await;
 
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-    let calculator = setup_lightweight_calculator(temp_dir.path(), &pool).await;
+    let calculator = setup_lightweight_calculator(temp_dir.path(), pool.clone()).await;
     reset_db_state(&pool, 5).await;
-    run_calculator(calculator, pool.clone()).await;
+    run_calculator(calculator).await;
 
-    let mut calculator = setup_lightweight_calculator(temp_dir.path(), &pool).await;
+    let mut calculator = setup_lightweight_calculator(temp_dir.path(), pool.clone()).await;
     let (stop_sx, stop_rx) = watch::channel(false);
     let (delay_sx, mut delay_rx) = mpsc::unbounded_channel();
     calculator.delayer.delay_notifier = delay_sx;
 
-    let calculator_handle = tokio::spawn(calculator.run(pool.clone(), stop_rx));
+    let calculator_handle = tokio::spawn(calculator.run(stop_rx));
     // Wait until the calculator has processed initial L1 batches.
     let (next_l1_batch, _) = tokio::time::timeout(RUN_TIMEOUT, delay_rx.recv())
         .await
@@ -205,7 +234,7 @@ async fn running_metadata_calculator_with_additional_blocks() {
 
     // Add some new blocks to the storage.
     let new_logs = gen_storage_logs(100..200, 10);
-    extend_db_state(&mut pool.access_storage().await.unwrap(), new_logs).await;
+    extend_db_state(&mut pool.connection().await.unwrap(), new_logs).await;
 
     // Wait until these blocks are processed. The calculator may have spurious delays,
     // thus we wait in a loop.
@@ -226,30 +255,27 @@ async fn running_metadata_calculator_with_additional_blocks() {
         .unwrap();
 
     // Switch to the full tree. It should pick up from the same spot and result in the same tree root hash.
-    let (calculator, _) = setup_calculator(temp_dir.path(), &pool).await;
-    let root_hash_for_full_tree = run_calculator(calculator, pool).await;
+    let (calculator, _) = setup_calculator(temp_dir.path(), pool).await;
+    let root_hash_for_full_tree = run_calculator(calculator).await;
     assert_eq!(root_hash_for_full_tree, updated_root_hash);
 }
 
 #[tokio::test]
 async fn shutting_down_calculator() {
-    let pool = ConnectionPool::test_pool().await;
+    let pool = ConnectionPool::<Core>::test_pool().await;
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-    let (merkle_tree_config, mut operation_config) = create_config(temp_dir.path());
+    let (merkle_tree_config, mut operation_config) =
+        create_config(temp_dir.path(), MerkleTreeMode::Lightweight);
     operation_config.delay_interval = 30_000; // ms; chosen to be larger than `RUN_TIMEOUT`
 
-    let calculator = setup_calculator_with_options(
-        &merkle_tree_config,
-        &operation_config,
-        &pool,
-        MetadataCalculatorModeConfig::Lightweight,
-    )
-    .await;
+    let calculator =
+        setup_calculator_with_options(&merkle_tree_config, &operation_config, pool.clone(), None)
+            .await;
 
     reset_db_state(&pool, 5).await;
 
     let (stop_sx, stop_rx) = watch::channel(false);
-    let calculator_task = tokio::spawn(calculator.run(pool, stop_rx));
+    let calculator_task = tokio::spawn(calculator.run(stop_rx));
     tokio::time::sleep(Duration::from_millis(100)).await;
     stop_sx.send_replace(true);
     run_with_timeout(RUN_TIMEOUT, calculator_task)
@@ -262,15 +288,15 @@ async fn test_postgres_backup_recovery(
     sleep_between_batches: bool,
     insert_batch_without_metadata: bool,
 ) {
-    let pool = ConnectionPool::test_pool().await;
+    let pool = ConnectionPool::<Core>::test_pool().await;
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-    let calculator = setup_lightweight_calculator(temp_dir.path(), &pool).await;
+    let calculator = setup_lightweight_calculator(temp_dir.path(), pool.clone()).await;
     reset_db_state(&pool, 5).await;
-    run_calculator(calculator, pool.clone()).await;
+    run_calculator(calculator).await;
 
     // Simulate recovery from a DB snapshot in which some newer L1 batches are erased.
     let last_batch_after_recovery = L1BatchNumber(3);
-    let mut storage = pool.access_storage().await.unwrap();
+    let mut storage = pool.connection().await.unwrap();
     let removed_batches = remove_l1_batches(&mut storage, last_batch_after_recovery).await;
 
     if insert_batch_without_metadata {
@@ -282,25 +308,19 @@ async fn test_postgres_backup_recovery(
         // Re-insert the last batch without metadata immediately.
         storage
             .blocks_dal()
-            .insert_l1_batch(
-                batch_without_metadata,
-                &[],
-                BlockGasCount::default(),
-                &[],
-                &[],
-            )
+            .insert_mock_l1_batch(batch_without_metadata)
             .await
             .unwrap();
         insert_initial_writes_for_batch(&mut storage, batch_without_metadata.number).await;
     }
     drop(storage);
 
-    let mut calculator = setup_lightweight_calculator(temp_dir.path(), &pool).await;
+    let mut calculator = setup_lightweight_calculator(temp_dir.path(), pool.clone()).await;
     let (stop_sx, stop_rx) = watch::channel(false);
     let (delay_sx, mut delay_rx) = mpsc::unbounded_channel();
     calculator.delayer.delay_notifier = delay_sx;
 
-    let calculator_handle = tokio::spawn(calculator.run(pool.clone(), stop_rx));
+    let calculator_handle = tokio::spawn(calculator.run(stop_rx));
     // Wait until the calculator has processed initial L1 batches.
     let (next_l1_batch, _) = tokio::time::timeout(RUN_TIMEOUT, delay_rx.recv())
         .await
@@ -309,11 +329,11 @@ async fn test_postgres_backup_recovery(
     assert_eq!(next_l1_batch, last_batch_after_recovery + 1);
 
     // Re-insert L1 batches to the storage after recovery.
-    let mut storage = pool.access_storage().await.unwrap();
+    let mut storage = pool.connection().await.unwrap();
     for batch_header in &removed_batches {
         let mut txn = storage.start_transaction().await.unwrap();
         txn.blocks_dal()
-            .insert_l1_batch(batch_header, &[], BlockGasCount::default(), &[], &[])
+            .insert_mock_l1_batch(batch_header)
             .await
             .unwrap();
         insert_initial_writes_for_batch(&mut txn, batch_header.number).await;
@@ -359,28 +379,33 @@ async fn postgres_backup_recovery_with_excluded_metadata() {
 
 pub(crate) async fn setup_calculator(
     db_path: &Path,
-    pool: &ConnectionPool,
-) -> (MetadataCalculator, Box<dyn ObjectStore>) {
-    let store_factory = &ObjectStoreFactory::mock();
-    let (merkle_tree_config, operation_manager) = create_config(db_path);
-    let mode = MetadataCalculatorModeConfig::Full {
-        store_factory: Some(store_factory),
-    };
+    pool: ConnectionPool<Core>,
+) -> (MetadataCalculator, Arc<dyn ObjectStore>) {
+    let store_factory = ObjectStoreFactory::mock();
+    let store = store_factory.create_store().await;
+    let (merkle_tree_config, operation_manager) = create_config(db_path, MerkleTreeMode::Full);
     let calculator =
-        setup_calculator_with_options(&merkle_tree_config, &operation_manager, pool, mode).await;
+        setup_calculator_with_options(&merkle_tree_config, &operation_manager, pool, Some(store))
+            .await;
     (calculator, store_factory.create_store().await)
 }
 
-async fn setup_lightweight_calculator(db_path: &Path, pool: &ConnectionPool) -> MetadataCalculator {
-    let mode = MetadataCalculatorModeConfig::Lightweight;
-    let (db_config, operation_config) = create_config(db_path);
-    setup_calculator_with_options(&db_config, &operation_config, pool, mode).await
+async fn setup_lightweight_calculator(
+    db_path: &Path,
+    pool: ConnectionPool<Core>,
+) -> MetadataCalculator {
+    let (db_config, operation_config) = create_config(db_path, MerkleTreeMode::Lightweight);
+    setup_calculator_with_options(&db_config, &operation_config, pool, None).await
 }
 
-fn create_config(db_path: &Path) -> (MerkleTreeConfig, OperationsManagerConfig) {
+fn create_config(
+    db_path: &Path,
+    mode: MerkleTreeMode,
+) -> (MerkleTreeConfig, OperationsManagerConfig) {
     let db_config = MerkleTreeConfig {
         path: path_to_string(&db_path.join("new")),
-        ..Default::default()
+        mode,
+        ..MerkleTreeConfig::default()
     };
 
     let operation_config = OperationsManagerConfig {
@@ -392,30 +417,29 @@ fn create_config(db_path: &Path) -> (MerkleTreeConfig, OperationsManagerConfig) 
 async fn setup_calculator_with_options(
     merkle_tree_config: &MerkleTreeConfig,
     operation_config: &OperationsManagerConfig,
-    pool: &ConnectionPool,
-    mode: MetadataCalculatorModeConfig<'_>,
+    pool: ConnectionPool<Core>,
+    object_store: Option<Arc<dyn ObjectStore>>,
 ) -> MetadataCalculator {
-    let calculator_config =
-        MetadataCalculatorConfig::for_main_node(merkle_tree_config, operation_config, mode);
-    let metadata_calculator = MetadataCalculator::new(&calculator_config).await;
-
-    let mut storage = pool.access_storage().await.unwrap();
+    let mut storage = pool.connection().await.unwrap();
     if storage.blocks_dal().is_genesis_needed().await.unwrap() {
-        ensure_genesis_state(&mut storage, L2ChainId::from(270), &GenesisParams::mock())
+        insert_genesis_batch(&mut storage, &GenesisParams::mock())
             .await
             .unwrap();
     }
-    metadata_calculator
+    drop(storage);
+
+    let calculator_config =
+        MetadataCalculatorConfig::for_main_node(merkle_tree_config, operation_config);
+    MetadataCalculator::new(calculator_config, object_store, pool)
+        .await
+        .unwrap()
 }
 
 fn path_to_string(path: &Path) -> String {
     path.to_str().unwrap().to_owned()
 }
 
-pub(crate) async fn run_calculator(
-    mut calculator: MetadataCalculator,
-    pool: ConnectionPool,
-) -> H256 {
+pub(crate) async fn run_calculator(mut calculator: MetadataCalculator) -> H256 {
     let (stop_sx, stop_rx) = watch::channel(false);
     let (delay_sx, mut delay_rx) = mpsc::unbounded_channel();
     calculator.delayer.delay_notifier = delay_sx;
@@ -430,27 +454,33 @@ pub(crate) async fn run_calculator(
         root_hash
     });
 
-    run_with_timeout(RUN_TIMEOUT, calculator.run(pool, stop_rx))
+    run_with_timeout(RUN_TIMEOUT, calculator.run(stop_rx))
         .await
         .unwrap();
     delayer_handle.await.unwrap()
 }
 
-pub(crate) async fn reset_db_state(pool: &ConnectionPool, num_batches: usize) {
-    let mut storage = pool.access_storage().await.unwrap();
+pub(crate) async fn reset_db_state(pool: &ConnectionPool<Core>, num_batches: usize) {
+    let mut storage = pool.connection().await.unwrap();
     // Drops all L1 batches (except the L1 batch with number 0) and their storage logs.
     storage
         .storage_logs_dal()
-        .rollback_storage_logs(MiniblockNumber(0))
-        .await;
+        .roll_back_storage_logs(L2BlockNumber(0))
+        .await
+        .unwrap();
     storage
         .blocks_dal()
-        .delete_miniblocks(MiniblockNumber(0))
+        .delete_l2_blocks(L2BlockNumber(0))
         .await
         .unwrap();
     storage
         .blocks_dal()
         .delete_l1_batches(L1BatchNumber(0))
+        .await
+        .unwrap();
+    storage
+        .blocks_dal()
+        .delete_initial_writes(L1BatchNumber(0))
         .await
         .unwrap();
     storage
@@ -464,79 +494,67 @@ pub(crate) async fn reset_db_state(pool: &ConnectionPool, num_batches: usize) {
 }
 
 pub(super) async fn extend_db_state(
-    storage: &mut StorageProcessor<'_>,
+    storage: &mut Connection<'_, Core>,
     new_logs: impl IntoIterator<Item = Vec<StorageLog>>,
 ) {
     let mut storage = storage.start_transaction().await.unwrap();
-    let next_l1_batch = storage
+    let sealed_l1_batch = storage
         .blocks_dal()
         .get_sealed_l1_batch_number()
         .await
         .unwrap()
-        .0
-        + 1;
+        .expect("no L1 batches in Postgres");
+    extend_db_state_from_l1_batch(&mut storage, sealed_l1_batch + 1, new_logs).await;
+    storage.commit().await.unwrap();
+}
 
-    let base_system_contracts = BaseSystemContracts::load_from_disk();
-    for (idx, batch_logs) in (next_l1_batch..).zip(new_logs) {
-        let batch_number = L1BatchNumber(idx);
-        let mut header = L1BatchHeader::new(
-            batch_number,
-            0,
-            Address::default(),
-            base_system_contracts.hashes(),
-            Default::default(),
-        );
-        header.is_finished = true;
+pub(super) async fn extend_db_state_from_l1_batch(
+    storage: &mut Connection<'_, Core>,
+    next_l1_batch: L1BatchNumber,
+    new_logs: impl IntoIterator<Item = Vec<StorageLog>>,
+) {
+    assert!(storage.in_transaction(), "must be called in DB transaction");
 
-        // Assumes that L1 batch consists of only one miniblock.
-        let miniblock_number = MiniblockNumber(idx);
-        let miniblock_header = MiniblockHeader {
-            number: miniblock_number,
-            timestamp: header.timestamp,
-            hash: MiniblockHasher::new(miniblock_number, header.timestamp, H256::zero())
-                .finalize(ProtocolVersionId::latest()),
-            l1_tx_count: header.l1_tx_count,
-            l2_tx_count: header.l2_tx_count,
-            base_fee_per_gas: header.base_fee_per_gas,
-            l1_gas_price: 0,
-            l2_fair_gas_price: 0,
-            base_system_contracts_hashes: base_system_contracts.hashes(),
-            protocol_version: Some(ProtocolVersionId::latest()),
-            virtual_blocks: 0,
-        };
+    for (idx, batch_logs) in (next_l1_batch.0..).zip(new_logs) {
+        let header = create_l1_batch(idx);
+        let batch_number = header.number;
+        // Assumes that L1 batch consists of only one L2 block.
+        let l2_block_header = create_l2_block(idx);
+        let l2_block_number = l2_block_header.number;
 
         storage
             .blocks_dal()
-            .insert_l1_batch(&header, &[], BlockGasCount::default(), &[], &[])
+            .insert_mock_l1_batch(&header)
             .await
             .unwrap();
         storage
             .blocks_dal()
-            .insert_miniblock(&miniblock_header)
+            .insert_l2_block(&l2_block_header)
             .await
             .unwrap();
         storage
             .storage_logs_dal()
-            .insert_storage_logs(miniblock_number, &[(H256::zero(), batch_logs)])
-            .await;
-        storage
-            .blocks_dal()
-            .mark_miniblocks_as_executed_in_l1_batch(batch_number)
+            .insert_storage_logs(l2_block_number, &[(H256::zero(), batch_logs)])
             .await
             .unwrap();
-        insert_initial_writes_for_batch(&mut storage, batch_number).await;
+        storage
+            .blocks_dal()
+            .mark_l2_blocks_as_executed_in_l1_batch(batch_number)
+            .await
+            .unwrap();
+        insert_initial_writes_for_batch(storage, batch_number).await;
     }
-    storage.commit().await.unwrap();
 }
 
 async fn insert_initial_writes_for_batch(
-    connection: &mut StorageProcessor<'_>,
+    connection: &mut Connection<'_, Core>,
     l1_batch_number: L1BatchNumber,
 ) {
     let written_non_zero_slots: Vec<_> = connection
         .storage_logs_dal()
         .get_touched_slots_for_l1_batch(l1_batch_number)
         .await
+        .unwrap()
         .into_iter()
         .filter_map(|(key, value)| (!value.is_zero()).then_some(key))
         .collect();
@@ -547,7 +565,8 @@ async fn insert_initial_writes_for_batch(
     let pre_written_slots = connection
         .storage_logs_dedup_dal()
         .filter_written_slots(&hashed_keys)
-        .await;
+        .await
+        .unwrap();
 
     let keys_to_insert: Vec<_> = written_non_zero_slots
         .into_iter()
@@ -557,7 +576,8 @@ async fn insert_initial_writes_for_batch(
     connection
         .storage_logs_dedup_dal()
         .insert_initial_writes(l1_batch_number, &keys_to_insert)
-        .await;
+        .await
+        .unwrap();
 }
 
 pub(crate) fn gen_storage_logs(
@@ -598,14 +618,15 @@ pub(crate) fn gen_storage_logs(
 }
 
 async fn remove_l1_batches(
-    storage: &mut StorageProcessor<'_>,
+    storage: &mut Connection<'_, Core>,
     last_l1_batch_to_keep: L1BatchNumber,
 ) -> Vec<L1BatchHeader> {
     let sealed_l1_batch_number = storage
         .blocks_dal()
         .get_sealed_l1_batch_number()
         .await
-        .unwrap();
+        .unwrap()
+        .expect("no L1 batches in Postgres");
     assert!(sealed_l1_batch_number >= last_l1_batch_to_keep);
 
     let mut batch_headers = vec![];
@@ -623,14 +644,19 @@ async fn remove_l1_batches(
         .delete_l1_batches(last_l1_batch_to_keep)
         .await
         .unwrap();
+    storage
+        .blocks_dal()
+        .delete_initial_writes(last_l1_batch_to_keep)
+        .await
+        .unwrap();
     batch_headers
 }
 
 #[tokio::test]
 async fn deduplication_works_as_expected() {
-    let pool = ConnectionPool::test_pool().await;
-    let mut storage = pool.access_storage().await.unwrap();
-    ensure_genesis_state(&mut storage, L2ChainId::from(270), &GenesisParams::mock())
+    let pool = ConnectionPool::<Core>::test_pool().await;
+    let mut storage = pool.connection().await.unwrap();
+    insert_genesis_batch(&mut storage, &GenesisParams::mock())
         .await
         .unwrap();
 
@@ -641,7 +667,8 @@ async fn deduplication_works_as_expected() {
     let initial_writes = storage
         .storage_logs_dal()
         .get_l1_batches_and_indices_for_initial_writes(&hashed_keys)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(initial_writes.len(), hashed_keys.len());
     assert!(initial_writes
         .values()
@@ -660,7 +687,8 @@ async fn deduplication_works_as_expected() {
     let initial_writes = storage
         .storage_logs_dal()
         .get_l1_batches_and_indices_for_initial_writes(&hashed_keys)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(initial_writes.len(), hashed_keys.len());
     assert!(initial_writes
         .values()
@@ -669,7 +697,8 @@ async fn deduplication_works_as_expected() {
     let initial_writes = storage
         .storage_logs_dal()
         .get_l1_batches_and_indices_for_initial_writes(&new_hashed_keys)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(initial_writes.len(), new_hashed_keys.len());
     assert!(initial_writes
         .values()
@@ -685,7 +714,8 @@ async fn deduplication_works_as_expected() {
     let initial_writes = storage
         .storage_logs_dal()
         .get_l1_batches_and_indices_for_initial_writes(&no_op_hashed_keys)
-        .await;
+        .await
+        .unwrap();
     assert!(initial_writes.is_empty());
 
     let updated_logs: Vec<_> = no_op_logs
@@ -702,7 +732,8 @@ async fn deduplication_works_as_expected() {
     let initial_writes = storage
         .storage_logs_dal()
         .get_l1_batches_and_indices_for_initial_writes(&no_op_hashed_keys)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(initial_writes.len(), no_op_hashed_keys.len() / 2);
     for key in no_op_hashed_keys.iter().step_by(2) {
         assert_eq!(initial_writes[key].0, L1BatchNumber(4));

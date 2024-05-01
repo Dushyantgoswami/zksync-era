@@ -3,23 +3,21 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use zksync_types::web3::{
     self,
-    contract::{
-        tokens::{Detokenize, Tokenize},
-        Contract, Options,
-    },
-    ethabi,
+    contract::Contract,
+    ethabi, helpers,
+    helpers::CallFuture,
     transports::Http,
     types::{
-        Address, Block, BlockId, BlockNumber, Bytes, Filter, Log, Transaction, TransactionId,
+        Address, BlockId, BlockNumber, Bytes, Filter, Log, Transaction, TransactionId,
         TransactionReceipt, H256, U256, U64,
     },
-    Web3,
+    Transport, Web3,
 };
 
 use crate::{
     clients::http::{Method, COUNTERS, LATENCIES},
-    types::{Error, ExecutedTxStatus, FailureInfo},
-    EthInterface,
+    types::{Error, ExecutedTxStatus, FailureInfo, FeeHistory, RawTokens},
+    Block, ContractCall, EthInterface, RawTransactionBytes,
 };
 
 /// An "anonymous" Ethereum client that can invoke read-only methods that aren't
@@ -40,7 +38,7 @@ impl From<Http> for QueryClient {
 impl QueryClient {
     /// Creates a new HTTP client.
     pub fn new(node_url: &str) -> Result<Self, Error> {
-        let transport = web3::transports::Http::new(node_url)?;
+        let transport = Http::new(node_url)?;
         Ok(transport.into())
     }
 }
@@ -80,9 +78,9 @@ impl EthInterface for QueryClient {
         Ok(network_gas_price)
     }
 
-    async fn send_raw_tx(&self, tx: Vec<u8>) -> Result<H256, Error> {
+    async fn send_raw_tx(&self, tx: RawTransactionBytes) -> Result<H256, Error> {
         let latency = LATENCIES.direct[&Method::SendRawTx].start();
-        let tx = self.web3.eth().send_raw_transaction(Bytes(tx)).await?;
+        let tx = self.web3.eth().send_raw_transaction(Bytes(tx.0)).await?;
         latency.observe();
         Ok(tx)
     }
@@ -100,20 +98,25 @@ impl EthInterface for QueryClient {
         let mut history = Vec::with_capacity(block_count);
         let from_block = upto_block.saturating_sub(block_count);
 
-        // Here we are requesting fee_history from blocks
-        // (from_block; upto_block] in chunks of size MAX_REQUEST_CHUNK
+        // Here we are requesting `fee_history` from blocks
+        // `(from_block; upto_block)` in chunks of size `MAX_REQUEST_CHUNK`
         // starting from the oldest block.
         for chunk_start in (from_block..=upto_block).step_by(MAX_REQUEST_CHUNK) {
             let chunk_end = (chunk_start + MAX_REQUEST_CHUNK).min(upto_block);
             let chunk_size = chunk_end - chunk_start;
-            let chunk = self
-                .web3
-                .eth()
-                .fee_history(chunk_size.into(), chunk_end.into(), None)
-                .await?
-                .base_fee_per_gas;
 
-            history.extend(chunk);
+            let block_count = helpers::serialize(&U256::from(chunk_size));
+            let newest_block = helpers::serialize(&web3::types::BlockNumber::from(chunk_end));
+            let reward_percentiles = helpers::serialize(&Option::<()>::None);
+
+            let fee_history: FeeHistory = CallFuture::new(self.web3.transport().execute(
+                "eth_feeHistory",
+                vec![block_count, newest_block, reward_percentiles],
+            ))
+            .await?;
+            if let Some(base_fees) = fee_history.base_fee_per_gas {
+                history.extend(base_fees);
+            }
         }
 
         latency.observe();
@@ -131,8 +134,18 @@ impl EthInterface for QueryClient {
             .web3
             .eth()
             .block(BlockId::Number(BlockNumber::Pending))
-            .await?
-            .expect("Pending block should always exist");
+            .await?;
+        let block = if let Some(block) = block {
+            block
+        } else {
+            // Fallback for local reth. Because of artificial nature of producing blocks in local reth setup
+            // there may be no pending block
+            self.web3
+                .eth()
+                .block(BlockId::Number(BlockNumber::Latest))
+                .await?
+                .expect("Latest block always exists")
+        };
 
         latency.observe();
         // base_fee_per_gas always exists after London fork
@@ -233,26 +246,21 @@ impl EthInterface for QueryClient {
         Ok(tx)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn call_contract_function<R, A, B, P>(
+    async fn call_contract_function(
         &self,
-        func: &str,
-        params: P,
-        from: A,
-        options: Options,
-        block: B,
-        contract_address: Address,
-        contract_abi: ethabi::Contract,
-    ) -> Result<R, Error>
-    where
-        R: Detokenize + Unpin,
-        A: Into<Option<Address>> + Send,
-        B: Into<Option<BlockId>> + Send,
-        P: Tokenize + Send,
-    {
+        call: ContractCall,
+    ) -> Result<Vec<ethabi::Token>, Error> {
         let latency = LATENCIES.direct[&Method::CallContractFunction].start();
-        let contract = Contract::new(self.web3.eth(), contract_address, contract_abi);
-        let res = contract.query(func, params, from, options, block).await?;
+        let contract = Contract::new(self.web3.eth(), call.contract_address, call.contract_abi);
+        let RawTokens(res) = contract
+            .query(
+                &call.inner.name,
+                call.inner.params,
+                call.inner.from,
+                call.inner.options,
+                call.inner.block,
+            )
+            .await?;
         latency.observe();
         Ok(res)
     }
@@ -292,7 +300,28 @@ impl EthInterface for QueryClient {
     ) -> Result<Option<Block<H256>>, Error> {
         COUNTERS.call[&(Method::Block, component)].inc();
         let latency = LATENCIES.direct[&Method::Block].start();
-        let block = self.web3.eth().block(block_id).await?;
+        // Copy of `web3::block` implementation. It's required to deserialize response as `crate::types::Block`
+        // that has EIP-4844 fields.
+        let block = {
+            let include_txs = helpers::serialize(&false);
+
+            let result = match block_id {
+                BlockId::Hash(hash) => {
+                    let hash = helpers::serialize(&hash);
+                    self.web3
+                        .transport()
+                        .execute("eth_getBlockByHash", vec![hash, include_txs])
+                }
+                BlockId::Number(num) => {
+                    let num = helpers::serialize(&num);
+                    self.web3
+                        .transport()
+                        .execute("eth_getBlockByNumber", vec![num, include_txs])
+                }
+            };
+
+            CallFuture::new(result).await?
+        };
         latency.observe();
         Ok(block)
     }

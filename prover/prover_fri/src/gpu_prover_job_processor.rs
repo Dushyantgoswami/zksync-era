@@ -3,10 +3,12 @@ pub mod gpu_prover {
     use std::{collections::HashMap, sync::Arc, time::Instant};
 
     use anyhow::Context as _;
-    use shivini::{gpu_prove_from_external_witness_data, ProverContext};
+    use prover_dal::{ConnectionPool, ProverDal};
+    use shivini::{
+        gpu_proof_config::GpuProofConfig, gpu_prove_from_external_witness_data, ProverContext,
+    };
     use tokio::task::JoinHandle;
     use zksync_config::configs::{fri_prover_group::FriProverGroupConfig, FriProverConfig};
-    use zksync_dal::ConnectionPool;
     use zksync_env_config::FromEnv;
     use zksync_object_store::ObjectStore;
     use zksync_prover_fri_types::{
@@ -22,14 +24,13 @@ pub mod gpu_prover {
             circuit_definitions::{
                 base_layer::ZkSyncBaseLayerProof, recursion_layer::ZkSyncRecursionLayerProof,
             },
+            recursion_layer_proof_config,
         },
         CircuitWrapper, FriProofWrapper, ProverServiceDataKey, WitnessVectorArtifacts,
     };
     use zksync_queued_job_processor::{async_trait, JobProcessor};
-    use zksync_types::{basic_fri_types::CircuitIdRoundTuple, proofs::SocketAddress};
-    use zksync_vk_setup_data_server_fri::{
-        get_setup_data_for_circuit_type, GoldilocksGpuProverSetupData,
-    };
+    use zksync_types::{basic_fri_types::CircuitIdRoundTuple, prover_dal::SocketAddress};
+    use zksync_vk_setup_data_server_fri::{keystore::Keystore, GoldilocksGpuProverSetupData};
 
     use crate::{
         metrics::METRICS,
@@ -49,10 +50,10 @@ pub mod gpu_prover {
 
     #[allow(dead_code)]
     pub struct Prover {
-        blob_store: Box<dyn ObjectStore>,
-        public_blob_store: Option<Box<dyn ObjectStore>>,
+        blob_store: Arc<dyn ObjectStore>,
+        public_blob_store: Option<Arc<dyn ObjectStore>>,
         config: Arc<FriProverConfig>,
-        prover_connection_pool: ConnectionPool,
+        prover_connection_pool: ConnectionPool<prover_dal::Prover>,
         setup_load_mode: SetupLoadMode,
         // Only pick jobs for the configured circuit id and aggregation rounds.
         // Empty means all jobs are picked.
@@ -66,10 +67,10 @@ pub mod gpu_prover {
     impl Prover {
         #[allow(dead_code)]
         pub fn new(
-            blob_store: Box<dyn ObjectStore>,
-            public_blob_store: Option<Box<dyn ObjectStore>>,
+            blob_store: Arc<dyn ObjectStore>,
+            public_blob_store: Option<Arc<dyn ObjectStore>>,
             config: FriProverConfig,
-            prover_connection_pool: ConnectionPool,
+            prover_connection_pool: ConnectionPool<prover_dal::Prover>,
             setup_load_mode: SetupLoadMode,
             circuit_ids_for_round_to_be_proven: Vec<CircuitIdRoundTuple>,
             witness_vector_queue: SharedWitnessVectorQueue,
@@ -103,9 +104,10 @@ pub mod gpu_prover {
                     .clone(),
                 SetupLoadMode::FromDisk => {
                     let started_at = Instant::now();
-                    let artifact: GoldilocksGpuProverSetupData =
-                        get_setup_data_for_circuit_type(key.clone())
-                            .context("get_setup_data_for_circuit_type()")?;
+                    let keystore = Keystore::default();
+                    let artifact: GoldilocksGpuProverSetupData = keystore
+                        .load_gpu_setup_data_for_circuit_type(key.clone())
+                        .context("load_gpu_setup_data_for_circuit_type()")?;
 
                     METRICS.gpu_setup_data_load_time[&key.circuit_id.to_string()]
                         .observe(started_at.elapsed());
@@ -121,7 +123,6 @@ pub mod gpu_prover {
         ) -> ProverArtifacts {
             let worker = Worker::new();
             let GpuProverJob {
-                assembly,
                 witness_vector_artifacts,
             } = job;
             let WitnessVectorArtifacts {
@@ -129,26 +130,27 @@ pub mod gpu_prover {
                 prover_job,
             } = witness_vector_artifacts;
 
-            let (proof_config, circuit_id) = match &prover_job.circuit_wrapper {
-                CircuitWrapper::Base(base_circuit) => (
+            let (gpu_proof_config, proof_config, circuit_id) = match &prover_job.circuit_wrapper {
+                CircuitWrapper::Base(circuit) => (
+                    GpuProofConfig::from_base_layer_circuit(circuit),
                     base_layer_proof_config(),
-                    base_circuit.numeric_circuit_type(),
+                    circuit.numeric_circuit_type(),
                 ),
-                CircuitWrapper::Recursive(recursive_circuit) => (
-                    base_layer_proof_config(),
-                    recursive_circuit.numeric_circuit_type(),
+                CircuitWrapper::Recursive(circuit) => (
+                    GpuProofConfig::from_recursive_layer_circuit(circuit),
+                    recursion_layer_proof_config(),
+                    circuit.numeric_circuit_type(),
                 ),
             };
 
             let started_at = Instant::now();
             let proof = gpu_prove_from_external_witness_data::<
-                _,
                 DefaultTranscript,
                 DefaultTreeHasher,
                 NoPow,
                 _,
             >(
-                &assembly,
+                &gpu_proof_config,
                 &witness_vector,
                 proof_config,
                 &setup_data.setup,
@@ -198,14 +200,25 @@ pub mod gpu_prover {
         const SERVICE_NAME: &'static str = "FriGpuProver";
 
         async fn get_next_job(&self) -> anyhow::Result<Option<(Self::JobId, Self::Job)>> {
+            let now = Instant::now();
+            tracing::info!("Attempting to get new job from assembly queue.");
             let mut queue = self.witness_vector_queue.lock().await;
             let is_full = queue.is_full();
+            tracing::info!(
+                "Queue has {} items with max capacity {}. Queue is_full = {}.",
+                queue.size(),
+                queue.capacity(),
+                is_full
+            );
             match queue.remove() {
-                Err(_) => Ok(None),
+                Err(_) => {
+                    tracing::warn!("No assembly available in queue after {:?}.", now.elapsed());
+                    Ok(None)
+                }
                 Ok(item) => {
                     if is_full {
                         self.prover_connection_pool
-                            .access_storage()
+                            .connection()
                             .await
                             .unwrap()
                             .fri_gpu_prover_queue_dal()
@@ -216,7 +229,8 @@ pub mod gpu_prover {
                             .await;
                     }
                     tracing::info!(
-                        "Started GPU proving for job: {:?}",
+                        "Assembly received after {:?}. Starting GPU proving for job: {:?}",
+                        now.elapsed(),
                         item.witness_vector_artifacts.prover_job.job_id
                     );
                     Ok(Some((
@@ -229,7 +243,7 @@ pub mod gpu_prover {
 
         async fn save_failure(&self, job_id: Self::JobId, _started_at: Instant, error: String) {
             self.prover_connection_pool
-                .access_storage()
+                .connection()
                 .await
                 .unwrap()
                 .fri_prover_jobs_dal()
@@ -239,6 +253,7 @@ pub mod gpu_prover {
 
         async fn process_job(
             &self,
+            _job_id: &Self::JobId,
             job: Self::Job,
             _started_at: Instant,
         ) -> JoinHandle<anyhow::Result<Self::JobArtifacts>> {
@@ -249,6 +264,8 @@ pub mod gpu_prover {
                     .clone(),
             );
             tokio::task::spawn_blocking(move || {
+                let block_number = job.witness_vector_artifacts.prover_job.block_number;
+                let _span = tracing::info_span!("gpu_prove", %block_number).entered();
                 Ok(Self::prove(job, setup_data.context("get_setup_data()")?))
             })
         }
@@ -261,7 +278,7 @@ pub mod gpu_prover {
         ) -> anyhow::Result<()> {
             METRICS.gpu_total_proving_time.observe(started_at.elapsed());
 
-            let mut storage_processor = self.prover_connection_pool.access_storage().await.unwrap();
+            let mut storage_processor = self.prover_connection_pool.connection().await.unwrap();
             save_proof(
                 job_id,
                 started_at,
@@ -282,7 +299,7 @@ pub mod gpu_prover {
         async fn get_job_attempts(&self, job_id: &u32) -> anyhow::Result<u32> {
             let mut prover_storage = self
                 .prover_connection_pool
-                .access_storage()
+                .connection()
                 .await
                 .context("failed to acquire DB connection for Prover")?;
             prover_storage
@@ -314,10 +331,12 @@ pub mod gpu_prover {
                     &config.specialized_group_id,
                     prover_setup_metadata_list
                 );
+                let keystore = Keystore::default();
                 for prover_setup_metadata in prover_setup_metadata_list {
                     let key = setup_metadata_to_setup_data_key(&prover_setup_metadata);
-                    let setup_data = get_setup_data_for_circuit_type(key.clone())
-                        .context("get_setup_data_for_circuit_type()")?;
+                    let setup_data = keystore
+                        .load_gpu_setup_data_for_circuit_type(key.clone())
+                        .context("load_gpu_setup_data_for_circuit_type()")?;
                     cache.insert(key, Arc::new(setup_data));
                 }
                 SetupLoadMode::FromMemory(cache)

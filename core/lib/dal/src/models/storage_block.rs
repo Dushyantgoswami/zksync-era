@@ -1,20 +1,20 @@
 use std::{convert::TryInto, str::FromStr};
 
 use bigdecimal::{BigDecimal, ToPrimitive};
-use sqlx::{
-    postgres::{PgArguments, Postgres},
-    query::Query,
-    types::chrono::{DateTime, NaiveDateTime, Utc},
-};
+use sqlx::types::chrono::{DateTime, NaiveDateTime, Utc};
 use thiserror::Error;
 use zksync_contracts::BaseSystemContractsHashes;
 use zksync_types::{
     api,
-    block::{L1BatchHeader, MiniblockHeader},
+    block::{L1BatchHeader, L2BlockHeader},
     commitment::{L1BatchMetaParameters, L1BatchMetadata},
+    fee_model::{BatchFeeInput, L1PeggedBatchFeeModelInput, PubdataIndependentBatchFeeModelInput},
     l2_to_l1_log::{L2ToL1Log, SystemL2ToL1Log, UserL2ToL1Log},
-    Address, L1BatchNumber, MiniblockNumber, H2048, H256,
+    Address, L1BatchNumber, L2BlockNumber, ProtocolVersionId, H2048, H256,
 };
+
+/// This is the gas limit that was used inside blocks before we started saving block gas limit into the database.
+pub const LEGACY_BLOCK_GAS_LIMIT: u32 = u32::MAX;
 
 #[derive(Debug, Error)]
 pub enum StorageL1BatchConvertError {
@@ -27,18 +27,13 @@ pub enum StorageL1BatchConvertError {
 pub struct StorageL1BatchHeader {
     pub number: i64,
     pub timestamp: i64,
-    pub is_finished: bool,
     pub l1_tx_count: i32,
     pub l2_tx_count: i32,
-    pub fee_account_address: Vec<u8>,
     pub l2_to_l1_logs: Vec<Vec<u8>>,
     pub l2_to_l1_messages: Vec<Vec<u8>>,
     pub bloom: Vec<u8>,
     pub priority_ops_onchain_data: Vec<Vec<u8>>,
     pub used_contract_hashes: serde_json::Value,
-    pub base_fee_per_gas: BigDecimal,
-    pub l1_gas_price: i64,
-    pub l2_fair_gas_price: i64,
     pub bootloader_code_hash: Option<Vec<u8>>,
     pub default_aa_code_hash: Option<Vec<u8>>,
     pub protocol_version: Option<i32>,
@@ -50,6 +45,7 @@ pub struct StorageL1BatchHeader {
     // will be exactly 7 (or 8 in the event of a protocol upgrade) system logs.
     pub system_logs: Vec<Vec<u8>>,
     pub compressed_state_diffs: Option<Vec<u8>>,
+    pub pubdata_input: Option<Vec<u8>>,
 }
 
 impl From<StorageL1BatchHeader> for L1BatchHeader {
@@ -65,9 +61,7 @@ impl From<StorageL1BatchHeader> for L1BatchHeader {
 
         L1BatchHeader {
             number: L1BatchNumber(l1_batch.number as u32),
-            is_finished: l1_batch.is_finished,
             timestamp: l1_batch.timestamp as u64,
-            fee_account_address: Address::from_slice(&l1_batch.fee_account_address),
             priority_ops_onchain_data,
             l1_tx_count: l1_batch.l1_tx_count as u16,
             l2_tx_count: l1_batch.l2_tx_count as u16,
@@ -77,20 +71,15 @@ impl From<StorageL1BatchHeader> for L1BatchHeader {
             bloom: H2048::from_slice(&l1_batch.bloom),
             used_contract_hashes: serde_json::from_value(l1_batch.used_contract_hashes)
                 .expect("invalid value for used_contract_hashes in the DB"),
-            base_fee_per_gas: l1_batch
-                .base_fee_per_gas
-                .to_u64()
-                .expect("base_fee_per_gas should fit in u64"),
             base_system_contracts_hashes: convert_base_system_contracts_hashes(
                 l1_batch.bootloader_code_hash,
                 l1_batch.default_aa_code_hash,
             ),
-            l1_gas_price: l1_batch.l1_gas_price as u64,
-            l2_fair_gas_price: l1_batch.l2_fair_gas_price as u64,
             system_logs: system_logs.into_iter().map(SystemL2ToL1Log).collect(),
             protocol_version: l1_batch
                 .protocol_version
                 .map(|v| (v as u16).try_into().unwrap()),
+            pubdata_input: l1_batch.pubdata_input,
         }
     }
 }
@@ -123,17 +112,13 @@ fn convert_base_system_contracts_hashes(
 pub struct StorageL1Batch {
     pub number: i64,
     pub timestamp: i64,
-    pub is_finished: bool,
     pub l1_tx_count: i32,
     pub l2_tx_count: i32,
-    pub fee_account_address: Vec<u8>,
     pub bloom: Vec<u8>,
     pub l2_to_l1_logs: Vec<Vec<u8>>,
     pub priority_ops_onchain_data: Vec<Vec<u8>>,
 
-    pub parent_hash: Option<Vec<u8>>,
     pub hash: Option<Vec<u8>>,
-    pub merkle_root_hash: Option<Vec<u8>>,
     pub commitment: Option<Vec<u8>>,
     pub meta_parameters_hash: Option<Vec<u8>>,
     pub pass_through_data_hash: Option<Vec<u8>>,
@@ -145,22 +130,15 @@ pub struct StorageL1Batch {
     pub default_aa_code_hash: Option<Vec<u8>>,
 
     pub l2_to_l1_messages: Vec<Vec<u8>>,
-    pub l2_l1_compressed_messages: Option<Vec<u8>>,
     pub l2_l1_merkle_root: Option<Vec<u8>>,
     pub compressed_initial_writes: Option<Vec<u8>>,
     pub compressed_repeated_writes: Option<Vec<u8>>,
-    pub compressed_write_logs: Option<Vec<u8>>,
-    pub compressed_contracts: Option<Vec<u8>>,
 
     pub eth_prove_tx_id: Option<i32>,
     pub eth_commit_tx_id: Option<i32>,
     pub eth_execute_tx_id: Option<i32>,
 
     pub used_contract_hashes: serde_json::Value,
-
-    pub base_fee_per_gas: BigDecimal,
-    pub l1_gas_price: i64,
-    pub l2_fair_gas_price: i64,
 
     pub system_logs: Vec<Vec<u8>>,
     pub compressed_state_diffs: Option<Vec<u8>>,
@@ -169,6 +147,7 @@ pub struct StorageL1Batch {
 
     pub events_queue_commitment: Option<Vec<u8>>,
     pub bootloader_initial_content_commitment: Option<Vec<u8>>,
+    pub pubdata_input: Option<Vec<u8>>,
 }
 
 impl From<StorageL1Batch> for L1BatchHeader {
@@ -184,9 +163,7 @@ impl From<StorageL1Batch> for L1BatchHeader {
 
         L1BatchHeader {
             number: L1BatchNumber(l1_batch.number as u32),
-            is_finished: l1_batch.is_finished,
             timestamp: l1_batch.timestamp as u64,
-            fee_account_address: Address::from_slice(&l1_batch.fee_account_address),
             priority_ops_onchain_data,
             l1_tx_count: l1_batch.l1_tx_count as u16,
             l2_tx_count: l1_batch.l2_tx_count as u16,
@@ -196,20 +173,15 @@ impl From<StorageL1Batch> for L1BatchHeader {
             bloom: H2048::from_slice(&l1_batch.bloom),
             used_contract_hashes: serde_json::from_value(l1_batch.used_contract_hashes)
                 .expect("invalid value for used_contract_hashes in the DB"),
-            base_fee_per_gas: l1_batch
-                .base_fee_per_gas
-                .to_u64()
-                .expect("base_fee_per_gas should fit in u64"),
             base_system_contracts_hashes: convert_base_system_contracts_hashes(
                 l1_batch.bootloader_code_hash,
                 l1_batch.default_aa_code_hash,
             ),
-            l1_gas_price: l1_batch.l1_gas_price as u64,
-            l2_fair_gas_price: l1_batch.l2_fair_gas_price as u64,
             system_logs: system_logs.into_iter().map(SystemL2ToL1Log).collect(),
             protocol_version: l1_batch
                 .protocol_version
                 .map(|v| (v as u16).try_into().unwrap()),
+            pubdata_input: l1_batch.pubdata_input,
         }
     }
 }
@@ -224,20 +196,8 @@ impl TryInto<L1BatchMetadata> for StorageL1Batch {
                 .rollup_last_leaf_index
                 .ok_or(StorageL1BatchConvertError::Incomplete)?
                 as u64,
-            merkle_root_hash: H256::from_slice(
-                &self
-                    .merkle_root_hash
-                    .ok_or(StorageL1BatchConvertError::Incomplete)?,
-            ),
-            initial_writes_compressed: self
-                .compressed_initial_writes
-                .ok_or(StorageL1BatchConvertError::Incomplete)?,
-            repeated_writes_compressed: self
-                .compressed_repeated_writes
-                .ok_or(StorageL1BatchConvertError::Incomplete)?,
-            l2_l1_messages_compressed: self
-                .l2_l1_compressed_messages
-                .ok_or(StorageL1BatchConvertError::Incomplete)?,
+            initial_writes_compressed: self.compressed_initial_writes,
+            repeated_writes_compressed: self.compressed_repeated_writes,
             l2_l1_merkle_root: H256::from_slice(
                 &self
                     .l2_l1_merkle_root
@@ -277,6 +237,10 @@ impl TryInto<L1BatchMetadata> for StorageL1Batch {
                         .default_aa_code_hash
                         .ok_or(StorageL1BatchConvertError::Incomplete)?,
                 ),
+                protocol_version: self
+                    .protocol_version
+                    .map(|v| (v as u16).try_into().unwrap())
+                    .ok_or(StorageL1BatchConvertError::Incomplete)?,
             },
             state_diffs_compressed: self.compressed_state_diffs.unwrap_or_default(),
             events_queue_commitment: self.events_queue_commitment.map(|v| H256::from_slice(&v)),
@@ -284,64 +248,6 @@ impl TryInto<L1BatchMetadata> for StorageL1Batch {
                 .bootloader_initial_content_commitment
                 .map(|v| H256::from_slice(&v)),
         })
-    }
-}
-
-/// Returns block_number SQL statement
-pub fn web3_block_number_to_sql(block_number: api::BlockNumber) -> String {
-    match block_number {
-        api::BlockNumber::Number(number) => number.to_string(),
-        api::BlockNumber::Earliest => 0.to_string(),
-        api::BlockNumber::Pending => {
-            "(SELECT (MAX(number) + 1) as number FROM miniblocks)".to_string()
-        }
-        api::BlockNumber::Latest | api::BlockNumber::Committed => {
-            "(SELECT MAX(number) as number FROM miniblocks)".to_string()
-        }
-        api::BlockNumber::Finalized => "
-                (SELECT COALESCE(
-                    (
-                        SELECT MAX(number) FROM miniblocks
-                        WHERE l1_batch_number = (
-                            SELECT MAX(number) FROM l1_batches
-                            JOIN eth_txs ON
-                                l1_batches.eth_execute_tx_id = eth_txs.id
-                            WHERE
-                                eth_txs.confirmed_eth_tx_history_id IS NOT NULL
-                        )
-                    ),
-                    0
-                ) as number)
-            "
-        .to_string(),
-    }
-}
-
-pub fn web3_block_where_sql(block_id: api::BlockId, arg_index: u8) -> String {
-    match block_id {
-        api::BlockId::Hash(_) => format!("miniblocks.hash = ${arg_index}"),
-        api::BlockId::Number(api::BlockNumber::Number(_)) => {
-            format!("miniblocks.number = ${arg_index}")
-        }
-        api::BlockId::Number(number) => {
-            let block_sql = web3_block_number_to_sql(number);
-            format!("miniblocks.number = {}", block_sql)
-        }
-    }
-}
-
-pub fn bind_block_where_sql_params<'q>(
-    block_id: &'q api::BlockId,
-    query: Query<'q, Postgres, PgArguments>,
-) -> Query<'q, Postgres, PgArguments> {
-    match block_id {
-        // these block_id types result in `$1` in the query string, which we have to `bind`
-        api::BlockId::Hash(block_hash) => query.bind(block_hash.as_bytes()),
-        api::BlockId::Number(api::BlockNumber::Number(number)) => {
-            query.bind(number.as_u64() as i64)
-        }
-        // others don't introduce `$1`, so we don't have to `bind` anything
-        _ => query,
     }
 }
 
@@ -365,61 +271,58 @@ pub struct StorageBlockDetails {
     pub l2_fair_gas_price: i64,
     pub bootloader_code_hash: Option<Vec<u8>>,
     pub default_aa_code_hash: Option<Vec<u8>>,
-    pub fee_account_address: Option<Vec<u8>>, // May be None if the block is not yet sealed
+    pub fee_account_address: Vec<u8>,
     pub protocol_version: Option<i32>,
 }
 
-impl StorageBlockDetails {
-    pub(crate) fn into_block_details(self, current_operator_address: Address) -> api::BlockDetails {
-        let status = if self.number == 0 || self.execute_tx_hash.is_some() {
+impl From<StorageBlockDetails> for api::BlockDetails {
+    fn from(details: StorageBlockDetails) -> Self {
+        let status = if details.number == 0 || details.execute_tx_hash.is_some() {
             api::BlockStatus::Verified
         } else {
             api::BlockStatus::Sealed
         };
 
         let base = api::BlockDetailsBase {
-            timestamp: self.timestamp as u64,
-            l1_tx_count: self.l1_tx_count as usize,
-            l2_tx_count: self.l2_tx_count as usize,
+            timestamp: details.timestamp as u64,
+            l1_tx_count: details.l1_tx_count as usize,
+            l2_tx_count: details.l2_tx_count as usize,
             status,
-            root_hash: self.root_hash.as_deref().map(H256::from_slice),
-            commit_tx_hash: self
+            root_hash: details.root_hash.as_deref().map(H256::from_slice),
+            commit_tx_hash: details
                 .commit_tx_hash
                 .as_deref()
                 .map(|hash| H256::from_str(hash).expect("Incorrect commit_tx hash")),
-            committed_at: self
+            committed_at: details
                 .committed_at
                 .map(|committed_at| DateTime::from_naive_utc_and_offset(committed_at, Utc)),
-            prove_tx_hash: self
+            prove_tx_hash: details
                 .prove_tx_hash
                 .as_deref()
                 .map(|hash| H256::from_str(hash).expect("Incorrect prove_tx hash")),
-            proven_at: self
+            proven_at: details
                 .proven_at
                 .map(|proven_at| DateTime::<Utc>::from_naive_utc_and_offset(proven_at, Utc)),
-            execute_tx_hash: self
+            execute_tx_hash: details
                 .execute_tx_hash
                 .as_deref()
                 .map(|hash| H256::from_str(hash).expect("Incorrect execute_tx hash")),
-            executed_at: self
+            executed_at: details
                 .executed_at
                 .map(|executed_at| DateTime::<Utc>::from_naive_utc_and_offset(executed_at, Utc)),
-            l1_gas_price: self.l1_gas_price as u64,
-            l2_fair_gas_price: self.l2_fair_gas_price as u64,
+            l1_gas_price: details.l1_gas_price as u64,
+            l2_fair_gas_price: details.l2_fair_gas_price as u64,
             base_system_contracts_hashes: convert_base_system_contracts_hashes(
-                self.bootloader_code_hash,
-                self.default_aa_code_hash,
+                details.bootloader_code_hash,
+                details.default_aa_code_hash,
             ),
         };
         api::BlockDetails {
             base,
-            number: MiniblockNumber(self.number as u32),
-            l1_batch_number: L1BatchNumber(self.l1_batch_number as u32),
-            operator_address: self
-                .fee_account_address
-                .map(|fee_account_address| Address::from_slice(&fee_account_address))
-                .unwrap_or(current_operator_address),
-            protocol_version: self
+            number: L2BlockNumber(details.number as u32),
+            l1_batch_number: L1BatchNumber(details.l1_batch_number as u32),
+            operator_address: Address::from_slice(&details.fee_account_address),
+            protocol_version: details
                 .protocol_version
                 .map(|v| (v as u16).try_into().unwrap()),
         }
@@ -494,12 +397,13 @@ impl From<StorageL1BatchDetails> for api::L1BatchDetails {
     }
 }
 
-pub struct StorageMiniblockHeader {
+pub struct StorageL2BlockHeader {
     pub number: i64,
     pub timestamp: i64,
     pub hash: Vec<u8>,
     pub l1_tx_count: i32,
     pub l2_tx_count: i32,
+    pub fee_account_address: Vec<u8>,
     pub base_fee_per_gas: BigDecimal,
     pub l1_gas_price: i64,
     // L1 gas price assumed in the corresponding batch
@@ -509,110 +413,79 @@ pub struct StorageMiniblockHeader {
     pub default_aa_code_hash: Option<Vec<u8>>,
     pub protocol_version: Option<i32>,
 
+    pub fair_pubdata_price: Option<i64>,
+
+    pub gas_per_pubdata_limit: i64,
+
     // The maximal number of virtual blocks that can be created with this miniblock.
     // If this value is greater than zero, then at least 1 will be created, but no more than
-    // min(virtual_blocks, miniblock_number - virtual_block_number), i.e. making sure that virtual blocks
+    // `min(virtual_blocks`, `miniblock_number - virtual_block_number`), i.e. making sure that virtual blocks
     // never go beyond the miniblock they are based on.
     pub virtual_blocks: i64,
+
+    /// The formal value of the gas limit for the miniblock.
+    /// This value should bound the maximal amount of gas that can be spent by transactions in the miniblock.
+    pub gas_limit: Option<i64>,
 }
 
-impl From<StorageMiniblockHeader> for MiniblockHeader {
-    fn from(row: StorageMiniblockHeader) -> Self {
-        MiniblockHeader {
-            number: MiniblockNumber(row.number as u32),
+impl From<StorageL2BlockHeader> for L2BlockHeader {
+    fn from(row: StorageL2BlockHeader) -> Self {
+        let protocol_version = row.protocol_version.map(|v| (v as u16).try_into().unwrap());
+
+        let fee_input = protocol_version
+            .filter(|version: &ProtocolVersionId| version.is_post_1_4_1())
+            .map(|_| {
+                BatchFeeInput::PubdataIndependent(PubdataIndependentBatchFeeModelInput {
+                    fair_pubdata_price: row
+                        .fair_pubdata_price
+                        .expect("No fair pubdata price for 1.4.1 miniblock")
+                        as u64,
+                    fair_l2_gas_price: row.l2_fair_gas_price as u64,
+                    l1_gas_price: row.l1_gas_price as u64,
+                })
+            })
+            .unwrap_or_else(|| {
+                BatchFeeInput::L1Pegged(L1PeggedBatchFeeModelInput {
+                    fair_l2_gas_price: row.l2_fair_gas_price as u64,
+                    l1_gas_price: row.l1_gas_price as u64,
+                })
+            });
+
+        L2BlockHeader {
+            number: L2BlockNumber(row.number as u32),
             timestamp: row.timestamp as u64,
             hash: H256::from_slice(&row.hash),
             l1_tx_count: row.l1_tx_count as u16,
             l2_tx_count: row.l2_tx_count as u16,
+            fee_account_address: Address::from_slice(&row.fee_account_address),
             base_fee_per_gas: row.base_fee_per_gas.to_u64().unwrap(),
-            l1_gas_price: row.l1_gas_price as u64,
-            l2_fair_gas_price: row.l2_fair_gas_price as u64,
+            batch_fee_input: fee_input,
             base_system_contracts_hashes: convert_base_system_contracts_hashes(
                 row.bootloader_code_hash,
                 row.default_aa_code_hash,
             ),
-            protocol_version: row.protocol_version.map(|v| (v as u16).try_into().unwrap()),
+            gas_per_pubdata_limit: row.gas_per_pubdata_limit as u64,
+            protocol_version,
             virtual_blocks: row.virtual_blocks as u32,
+            gas_limit: row.gas_limit.unwrap_or(i64::from(LEGACY_BLOCK_GAS_LIMIT)) as u64,
         }
     }
 }
 
-/// Information about L1 batch which a certain miniblock belongs to.
+/// Information about L1 batch which a certain L2 block belongs to.
 #[derive(Debug)]
-pub struct ResolvedL1BatchForMiniblock {
-    /// L1 batch which the miniblock belongs to. `None` if the miniblock is not explicitly attached
+pub struct ResolvedL1BatchForL2Block {
+    /// L1 batch which the L2 block belongs to. `None` if the L2 block is not explicitly attached
     /// (i.e., its L1 batch is not sealed).
-    pub miniblock_l1_batch: Option<L1BatchNumber>,
+    pub block_l1_batch: Option<L1BatchNumber>,
     /// Pending (i.e., unsealed) L1 batch.
     pub pending_l1_batch: L1BatchNumber,
 }
 
-impl ResolvedL1BatchForMiniblock {
-    /// Returns the L1 batch number that the miniblock has now or will have in the future (provided
+impl ResolvedL1BatchForL2Block {
+    /// Returns the L1 batch number that the L2 block has now or will have in the future (provided
     /// that the node will operate correctly).
     pub fn expected_l1_batch(&self) -> L1BatchNumber {
-        self.miniblock_l1_batch.unwrap_or(self.pending_l1_batch)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_web3_block_number_to_sql_earliest() {
-        let sql = web3_block_number_to_sql(api::BlockNumber::Earliest);
-        assert_eq!(sql, 0.to_string());
-    }
-
-    #[test]
-    fn test_web3_block_number_to_sql_pending() {
-        let sql = web3_block_number_to_sql(api::BlockNumber::Pending);
-        assert_eq!(
-            sql,
-            "(SELECT (MAX(number) + 1) as number FROM miniblocks)".to_string()
-        );
-    }
-
-    #[test]
-    fn test_web3_block_number_to_sql_latest() {
-        let sql = web3_block_number_to_sql(api::BlockNumber::Latest);
-        assert_eq!(
-            sql,
-            "(SELECT MAX(number) as number FROM miniblocks)".to_string()
-        );
-    }
-
-    #[test]
-    fn test_web3_block_number_to_sql_committed() {
-        let sql = web3_block_number_to_sql(api::BlockNumber::Committed);
-        assert_eq!(
-            sql,
-            "(SELECT MAX(number) as number FROM miniblocks)".to_string()
-        );
-    }
-
-    #[test]
-    fn test_web3_block_number_to_sql_finalized() {
-        let sql = web3_block_number_to_sql(api::BlockNumber::Finalized);
-        assert_eq!(
-            sql,
-            "
-                (SELECT COALESCE(
-                    (
-                        SELECT MAX(number) FROM miniblocks
-                        WHERE l1_batch_number = (
-                            SELECT MAX(number) FROM l1_batches
-                            JOIN eth_txs ON
-                                l1_batches.eth_execute_tx_id = eth_txs.id
-                            WHERE
-                                eth_txs.confirmed_eth_tx_history_id IS NOT NULL
-                        )
-                    ),
-                    0
-                ) as number)
-            "
-            .to_string()
-        );
+        self.block_l1_batch.unwrap_or(self.pending_l1_batch)
     }
 }

@@ -2,15 +2,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use futures::{channel::mpsc, future, SinkExt};
-use zksync::{
-    ethereum::{PriorityOpHolder, DEFAULT_PRIORITY_FEE},
-    utils::{
-        get_approval_based_paymaster_input, get_approval_based_paymaster_input_for_estimation,
-    },
-    web3::{contract::Options, types::TransactionReceipt},
-    EthNamespaceClient, EthereumProvider, ZksNamespaceClient,
-};
-use zksync_eth_client::{BoundEthInterface, EthInterface};
+use zksync_eth_client::{BoundEthInterface, EthInterface, Options};
 use zksync_eth_signer::PrivateKeySigner;
 use zksync_system_constants::MAX_L1_TRANSACTION_GAS_LIMIT;
 use zksync_types::{
@@ -25,6 +17,14 @@ use crate::{
     constants::*,
     report::ReportBuilder,
     report_collector::{LoadtestResult, ReportCollector},
+    sdk::{
+        ethereum::{PriorityOpHolder, DEFAULT_PRIORITY_FEE},
+        utils::{
+            get_approval_based_paymaster_input, get_approval_based_paymaster_input_for_estimation,
+        },
+        web3::types::TransactionReceipt,
+        EthNamespaceClient, EthereumProvider, ZksNamespaceClient,
+    },
     utils::format_eth,
 };
 
@@ -54,7 +54,7 @@ impl Executor {
     ) -> anyhow::Result<Self> {
         let pool = AccountPool::new(&config).await?;
 
-        // derive l2 main token address
+        // derive L2 main token address
         let l2_main_token = pool
             .master_wallet
             .ethereum(&config.l1_rpc_address)
@@ -442,6 +442,7 @@ impl Executor {
             let paymaster_params = get_approval_based_paymaster_input_for_estimation(
                 paymaster_address,
                 self.l2_main_token,
+                MIN_ALLOWANCE_FOR_PAYMASTER_ESTIMATE.into(),
             );
 
             let fee = builder.estimate_fee(Some(paymaster_params)).await?;
@@ -471,7 +472,7 @@ impl Executor {
                 .commit_timeout(COMMIT_TIMEOUT)
                 .wait_for_commit()
                 .await?;
-            if result.status == Some(U64::zero()) {
+            if result.status == U64::zero() {
                 return Err(anyhow::format_err!("Transfer failed"));
             }
         }

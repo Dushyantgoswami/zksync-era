@@ -1,4 +1,4 @@
-use zksync_system_constants::L2_ETH_TOKEN_ADDRESS;
+use zksync_system_constants::L2_BASE_TOKEN_ADDRESS;
 use zksync_types::{
     get_code_key, get_known_code_key, get_nonce_key,
     system_contracts::{DEPLOYMENT_NONCE_INCREMENT, TX_NONCE_INCREMENT},
@@ -13,6 +13,7 @@ use crate::{
             tester::{DeployContractsTx, TxType, VmTesterBuilder},
             utils::{get_balance, read_test_contract, verify_required_storage},
         },
+        utils::fee::get_batch_base_fee,
         HistoryEnabled,
     },
 };
@@ -34,13 +35,14 @@ fn test_default_aa_interaction() {
         bytecode_hash,
         address,
     } = account.get_deploy_tx(&counter, None, TxType::L2);
-    let maximal_fee = tx.gas_limit() * vm.vm.batch_env.base_fee();
+    let maximal_fee = tx.gas_limit() * get_batch_base_fee(&vm.vm.batch_env);
 
     vm.vm.push_transaction(tx);
     let result = vm.vm.execute(VmExecutionMode::OneTx);
     assert!(!result.result.is_failed(), "Transaction wasn't successful");
 
     vm.vm.execute(VmExecutionMode::Batch);
+
     vm.vm.get_current_execution_state();
 
     // Both deployment and ordinary nonce should be incremented by one.
@@ -62,9 +64,10 @@ fn test_default_aa_interaction() {
     verify_required_storage(&vm.vm.state, expected_slots);
 
     let expected_fee = maximal_fee
-        - U256::from(result.refunds.gas_refunded) * U256::from(vm.vm.batch_env.base_fee());
+        - U256::from(result.refunds.gas_refunded)
+            * U256::from(get_batch_base_fee(&vm.vm.batch_env));
     let operator_balance = get_balance(
-        AccountTreeId::new(L2_ETH_TOKEN_ADDRESS),
+        AccountTreeId::new(L2_BASE_TOKEN_ADDRESS),
         &vm.fee_account,
         vm.vm.state.storage.storage.get_ptr(),
     );

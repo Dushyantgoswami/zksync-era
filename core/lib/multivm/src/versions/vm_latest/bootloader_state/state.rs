@@ -14,7 +14,7 @@ use crate::{
             utils::{apply_l2_block, apply_tx_to_memory},
         },
         constants::TX_DESCRIPTION_OFFSET,
-        types::internals::{pubdata::PubdataInput, TransactionData},
+        types::internals::{PubdataInput, TransactionData},
         utils::l2_blocks::assert_next_block,
     },
 };
@@ -66,7 +66,7 @@ impl BootloaderState {
         }
     }
 
-    pub(crate) fn set_refund_for_current_tx(&mut self, refund: u32) {
+    pub(crate) fn set_refund_for_current_tx(&mut self, refund: u64) {
         let current_tx = self.current_tx();
         // We can't set the refund for the latest tx or using the latest l2_block for fining tx
         // Because we can fill the whole batch first and then execute txs one by one
@@ -100,7 +100,7 @@ impl BootloaderState {
         &mut self,
         tx: TransactionData,
         predefined_overhead: u32,
-        predefined_refund: u32,
+        predefined_refund: u64,
         compressed_bytecodes: Vec<CompressedBytecodeInfo>,
         trusted_ergs_limit: U256,
         chain_id: L2ChainId,
@@ -135,6 +135,11 @@ impl BootloaderState {
 
     pub(crate) fn last_l2_block(&self) -> &BootloaderL2Block {
         self.l2_blocks.last().unwrap()
+    }
+    pub(crate) fn get_pubdata_information(&self) -> &PubdataInput {
+        self.pubdata_information
+            .get()
+            .expect("Pubdata information is not set")
     }
 
     fn last_mut_l2_block(&mut self) -> &mut BootloaderL2Block {

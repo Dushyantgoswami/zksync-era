@@ -136,13 +136,13 @@ will return values for L2 blocks.
 ### Migration status
 
 At the time of this writing, the migration has been complete on testnet, i.e. there we already have only the L2 block
-information returned. However, the [migration](https://github.com/zkSync-Community-Hub/zkync-developers/discussions/87)
+information returned. However, the [migration](https://github.com/zkSync-Community-Hub/zksync-developers/discussions/87)
 on mainnet is still ongoing and most likely will end on late October / early November.
 
 ## Blocks’ processing and consistency checks
 
 Our `SystemContext` contract allows to get information about batches and L2 blocks. Some of the information is hard to
-calculate onchain. For instace, time. The timing information (for both batches and L2 blocks) are provided by the
+calculate onchain. For instance, time. The timing information (for both batches and L2 blocks) are provided by the
 operator. In order to check that the operator provided some realistic values, certain checks are done on L1. Generally
 though, we try to check as much as we can on L2.
 

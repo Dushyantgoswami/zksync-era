@@ -4,7 +4,7 @@ Assuming that you have completed [part 1](01_initialization.md) and [part 2](02_
 tokens back by simply calling the zksync-cli:
 
 ```bash
-npx zksync-cli bridge withdraw --chain=local-dockerized
+npx zksync-cli bridge withdraw --chain=dockerized-node
 ```
 
 And providing the account name (public address) and private key.
@@ -15,7 +15,7 @@ they didn't** - what happened?
 Actually we'll have to run one additional step:
 
 ```bash
-npx zksync-cli bridge withdraw-finalize --chain=local-dockerized
+npx zksync-cli bridge withdraw-finalize --chain=dockerized-node
 ```
 
 and pass the transaction that we received from the first call, into the `withdraw-finalize` call.
@@ -71,7 +71,7 @@ So the last question is -- what is the 'magic' contract address: `0x800a` ?
 
 ```solidity
 /// @dev The address of the eth token system contract
-address constant L2_ETH_TOKEN_SYSTEM_CONTRACT_ADDR = address(0x800a);
+address constant L2_BASE_TOKEN_SYSTEM_CONTRACT_ADDR = address(0x800a);
 
 ```
 
@@ -84,7 +84,7 @@ list here
 This is the place where we specify that `bootloader` is at address 0x8001, `NonceHolder` at 0x8003 etc.
 
 This brings us to
-[L2EthToken.sol](https://github.com/matter-labs/era-system-contracts/blob/main/contracts/L2EthToken.sol) that has the
+[L2BaseToken.sol](https://github.com/matter-labs/era-system-contracts/blob/main/contracts/L2EthToken.sol) that has the
 implementation of the L2 Eth.
 
 When we look inside, we can see:
@@ -120,7 +120,7 @@ BTW - all the transactions are sent to the 0x54e address - which is the `Diamond
 be different on your local node - see previous tutorial for more info) .
 
 And inside, all three methods above belong to
-[Executor.sol](https://github.com/matter-labs/era-contracts/blob/main/ethereum/contracts/zksync/facets/Executor.sol)
+[Executor.sol](https://github.com/matter-labs/era-contracts/blob/dev/l1-contracts/contracts/state-transition/chain-deps/facets/Executor.sol)
 facet and you can look at
 [README](https://github.com/matter-labs/era-contracts/blob/main/docs/Overview.md#executorfacet) to see the details of
 what each method does.

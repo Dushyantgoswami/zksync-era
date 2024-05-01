@@ -1,19 +1,20 @@
 import { BigNumberish } from '@ethersproject/bignumber';
 import { BytesLike, ethers } from 'ethers';
-import { ForceDeployUpgraderFactory as ForceDeployUpgraderFactoryL2 } from 'l2-zksync-contracts/typechain';
+import { ForceDeployUpgraderFactory as ForceDeployUpgraderFactoryL2 } from 'l2-contracts/typechain';
 import {
     DefaultUpgradeFactory as DefaultUpgradeFactoryL1,
     AdminFacetFactory,
     GovernanceFactory
-} from 'l1-zksync-contracts/typechain';
-import { FacetCut } from 'l1-zksync-contracts/src.ts/diamondCut';
+} from 'l1-contracts/typechain';
+import { FacetCut } from 'l1-contracts/src.ts/diamondCut';
 import { IZkSyncFactory } from '../pre-boojum/IZkSyncFactory';
-import { ComplexUpgrader__factory } from '../../../etc/system-contracts/typechain-types';
+import { ComplexUpgraderFactory } from 'system-contracts/typechain';
 import {
     getCommonDataFileName,
     getCryptoFileName,
     getFacetCutsFileName,
     getL2TransactionsFileName,
+    getPostUpgradeCalldataFileName,
     getL2UpgradeFileName,
     VerifierParams
 } from './utils';
@@ -150,7 +151,7 @@ export function forceDeploymentCalldata(forcedDeployments: ForceDeployment[]): B
 }
 
 export function prepareCallDataForComplexUpgrader(calldata: BytesLike, to: string): BytesLike {
-    const upgrader = new ComplexUpgrader__factory();
+    const upgrader = new ComplexUpgraderFactory();
     let finalCalldata = upgrader.interface.encodeFunctionData('upgrade', [to, calldata]);
     return finalCalldata;
 }
@@ -249,7 +250,8 @@ export function buildDefaultUpgradeTx(
     upgradeTimestamp,
     newAllowList,
     zksyncAddress,
-    useNewGovernance
+    useNewGovernance,
+    postUpgradeCalldataFlag
 ) {
     const commonData = JSON.parse(fs.readFileSync(getCommonDataFileName(), { encoding: 'utf-8' }));
     const protocolVersion = commonData.protocolVersion;
@@ -301,11 +303,22 @@ export function buildDefaultUpgradeTx(
         }
     }
 
+    let postUpgradeCalldata = '0x';
+    let postUpgradeCalldataFileName = getPostUpgradeCalldataFileName(environment);
+    if (postUpgradeCalldataFlag) {
+        if (fs.existsSync(postUpgradeCalldataFileName)) {
+            console.log(`Found facet cuts file ${postUpgradeCalldataFileName}`);
+            postUpgradeCalldata = JSON.parse(fs.readFileSync(postUpgradeCalldataFileName).toString());
+        } else {
+            throw new Error(`Post upgrade calldata file ${postUpgradeCalldataFileName} not found`);
+        }
+    }
+
     let proposeUpgradeTx = buildProposeUpgrade(
         ethers.BigNumber.from(upgradeTimestamp),
         protocolVersion,
         '0x',
-        '0x',
+        postUpgradeCalldata,
         cryptoVerifierParams,
         bootloaderHash,
         defaultAAHash,
@@ -371,7 +384,7 @@ async function sendTransaction(
     console.log('Transaction is executed');
 }
 
-function getWallet(l1rpc, privateKey) {
+export function getWallet(l1rpc, privateKey) {
     if (!l1rpc) {
         l1rpc = web3Url();
     }
@@ -522,7 +535,13 @@ command
     .option('--l1rpc <l1prc>')
     .option('--zksync-address <zksyncAddress>')
     .option('--use-new-governance')
+    .option('--post-upgrade-calldata')
     .action(async (options) => {
+        if (!options.useNewGovernance) {
+            // TODO(X): remove old governance functionality from the protocol upgrade tool
+            throw new Error('Old governance is not supported anymore');
+        }
+
         let diamondUpgradeProposalId = options.diamondUpgradeProposalId;
         if (!diamondUpgradeProposalId && !options.useNewGovernance) {
             diamondUpgradeProposalId = await getNewDiamondUpgradeProposalId(options.l1rpc, options.zksyncAddress);
@@ -536,7 +555,8 @@ command
             options.upgradeTimestamp,
             options.newAllowList,
             options.zksyncAddress,
-            options.useNewGovernance
+            options.useNewGovernance,
+            options.postUpgradeCalldata
         );
     });
 
@@ -550,6 +570,11 @@ command
     .option('--l1rpc <l1prc>')
     .option('--new-governance <newGovernance>')
     .action(async (options) => {
+        if (!options.newGovernance) {
+            // TODO(X): remove old governance functionality from the protocol upgrade tool
+            throw new Error('Old governance is not supported anymore');
+        }
+
         await proposeUpgrade(
             options.privateKey,
             options.l1rpc,
@@ -571,6 +596,11 @@ command
     .option('--l1rpc <l1prc>')
     .option('--new-governance <newGovernance>')
     .action(async (options) => {
+        if (!options.newGovernance) {
+            // TODO(X): remove old governance functionality from the protocol upgrade tool
+            throw new Error('Old governance is not supported anymore');
+        }
+
         await executeUpgrade(
             options.privateKey,
             options.l1rpc,
@@ -593,6 +623,11 @@ command
     .option('--execute')
     .option('--new-governance <newGovernance>')
     .action(async (options) => {
+        if (!options.newGovernance) {
+            // TODO(X): remove old governance functionality from the protocol upgrade tool
+            throw new Error('Old governance is not supported anymore');
+        }
+
         await cancelUpgrade(
             options.privateKey,
             options.l1rpc,

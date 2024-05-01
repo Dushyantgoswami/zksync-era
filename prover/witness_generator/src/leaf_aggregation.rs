@@ -1,13 +1,16 @@
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use zkevm_test_harness::witness::recursive_aggregation::{
-    compute_leaf_params, create_leaf_witnesses,
+use circuit_definitions::circuit_definitions::recursion_layer::base_circuit_type_into_recursive_leaf_circuit_type;
+use prover_dal::{Prover, ProverDal};
+use zkevm_test_harness::{
+    witness::recursive_aggregation::{compute_leaf_params, create_leaf_witnesses},
+    zkevm_circuits::scheduler::aux::BaseLayerCircuitType,
 };
 use zksync_config::configs::FriWitnessGeneratorConfig;
 use zksync_dal::ConnectionPool;
-use zksync_object_store::{ClosedFormInputKey, ObjectStore, ObjectStoreFactory};
+use zksync_object_store::{ObjectStore, ObjectStoreFactory};
 use zksync_prover_fri_types::{
     circuit_definitions::{
         boojum::field::goldilocks::GoldilocksField,
@@ -21,18 +24,17 @@ use zksync_prover_fri_types::{
         encodings::recursion_request::RecursionQueueSimulator,
         zkevm_circuits::recursion::leaf_layer::input::RecursionLeafParametersWitness,
     },
-    get_current_pod_name, FriProofWrapper,
+    get_current_pod_name,
+    keys::ClosedFormInputKey,
+    FriProofWrapper,
 };
 use zksync_prover_fri_utils::get_recursive_layer_circuit_id_for_base_layer;
 use zksync_queued_job_processor::JobProcessor;
 use zksync_types::{
-    proofs::{AggregationRound, LeafAggregationJobMetadata},
-    protocol_version::FriProtocolVersionId,
-    L1BatchNumber,
+    basic_fri_types::AggregationRound, protocol_version::ProtocolVersionId,
+    prover_dal::LeafAggregationJobMetadata, L1BatchNumber,
 };
-use zksync_vk_setup_data_server_fri::{
-    get_base_layer_vk_for_circuit_type, get_recursive_layer_vk_for_circuit_type,
-};
+use zksync_vk_setup_data_server_fri::keystore::Keystore;
 
 use crate::{
     metrics::WITNESS_GENERATOR_METRICS,
@@ -72,17 +74,17 @@ pub struct LeafAggregationWitnessGeneratorJob {
 #[derive(Debug)]
 pub struct LeafAggregationWitnessGenerator {
     config: FriWitnessGeneratorConfig,
-    object_store: Box<dyn ObjectStore>,
-    prover_connection_pool: ConnectionPool,
-    protocol_versions: Vec<FriProtocolVersionId>,
+    object_store: Arc<dyn ObjectStore>,
+    prover_connection_pool: ConnectionPool<Prover>,
+    protocol_versions: Vec<ProtocolVersionId>,
 }
 
 impl LeafAggregationWitnessGenerator {
     pub async fn new(
         config: FriWitnessGeneratorConfig,
         store_factory: &ObjectStoreFactory,
-        prover_connection_pool: ConnectionPool,
-        protocol_versions: Vec<FriProtocolVersionId>,
+        prover_connection_pool: ConnectionPool<Prover>,
+        protocol_versions: Vec<ProtocolVersionId>,
     ) -> Self {
         Self {
             config,
@@ -115,7 +117,7 @@ impl JobProcessor for LeafAggregationWitnessGenerator {
     const SERVICE_NAME: &'static str = "fri_leaf_aggregation_witness_generator";
 
     async fn get_next_job(&self) -> anyhow::Result<Option<(Self::JobId, Self::Job)>> {
-        let mut prover_connection = self.prover_connection_pool.access_storage().await.unwrap();
+        let mut prover_connection = self.prover_connection_pool.connection().await?;
         let pod_name = get_current_pod_name();
         let Some(metadata) = prover_connection
             .fri_witness_generator_dal()
@@ -135,7 +137,7 @@ impl JobProcessor for LeafAggregationWitnessGenerator {
 
     async fn save_failure(&self, job_id: u32, _started_at: Instant, error: String) -> () {
         self.prover_connection_pool
-            .access_storage()
+            .connection()
             .await
             .unwrap()
             .fri_witness_generator_dal()
@@ -146,10 +148,15 @@ impl JobProcessor for LeafAggregationWitnessGenerator {
     #[allow(clippy::async_yields_async)]
     async fn process_job(
         &self,
+        _job_id: &Self::JobId,
         job: LeafAggregationWitnessGeneratorJob,
         started_at: Instant,
     ) -> tokio::task::JoinHandle<anyhow::Result<LeafAggregationArtifacts>> {
-        tokio::task::spawn_blocking(move || Ok(Self::process_job_sync(job, started_at)))
+        tokio::task::spawn_blocking(move || {
+            let block_number = job.block_number;
+            let _span = tracing::info_span!("leaf_aggregation", %block_number).entered();
+            Ok(Self::process_job_sync(job, started_at))
+        })
     }
 
     async fn save_result(
@@ -191,7 +198,7 @@ impl JobProcessor for LeafAggregationWitnessGenerator {
     async fn get_job_attempts(&self, job_id: &u32) -> anyhow::Result<u32> {
         let mut prover_storage = self
             .prover_connection_pool
-            .access_storage()
+            .connection()
             .await
             .context("failed to acquire DB connection for LeafAggregationWitnessGenerator")?;
         prover_storage
@@ -215,11 +222,17 @@ pub async fn prepare_leaf_aggregation_job(
         .observe(started_at.elapsed());
 
     let started_at = Instant::now();
-    let base_vk = get_base_layer_vk_for_circuit_type(metadata.circuit_id)
+    let keystore = Keystore::default();
+    let base_vk = keystore
+        .load_base_layer_verification_key(metadata.circuit_id)
         .context("get_base_layer_vk_for_circuit_type()")?;
-    // this is a temp solution to unblock shadow proving.
-    // we should have a method that converts basic circuit id to leaf circuit id as they are different.
-    let leaf_vk = get_recursive_layer_vk_for_circuit_type(metadata.circuit_id + 2)
+
+    let leaf_circuit_id = base_circuit_type_into_recursive_leaf_circuit_type(
+        BaseLayerCircuitType::from_numeric_value(metadata.circuit_id),
+    ) as u8;
+
+    let leaf_vk = keystore
+        .load_recursive_layer_verification_key(leaf_circuit_id)
         .context("get_recursive_layer_vk_for_circuit_type()")?;
     let mut base_proofs = vec![];
     for wrapper in proofs {
@@ -277,7 +290,7 @@ pub fn process_leaf_aggregation_job(
 }
 
 async fn update_database(
-    prover_connection_pool: &ConnectionPool,
+    prover_connection_pool: &ConnectionPool<Prover>,
     started_at: Instant,
     block_number: L1BatchNumber,
     job_id: u32,
@@ -290,7 +303,7 @@ async fn update_database(
         block_number.0,
         circuit_id,
     );
-    let mut prover_connection = prover_connection_pool.access_storage().await.unwrap();
+    let mut prover_connection = prover_connection_pool.connection().await.unwrap();
     let mut transaction = prover_connection.start_transaction().await.unwrap();
     let number_of_dependent_jobs = blob_urls.circuit_ids_and_urls.len();
     let protocol_version_id = transaction

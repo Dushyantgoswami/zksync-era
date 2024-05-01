@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use prover_dal::{ConnectionPool, Prover};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{sync::watch, time::sleep};
-use zksync_dal::ConnectionPool;
 use zksync_object_store::ObjectStore;
 
 use crate::metrics::METRICS;
@@ -16,8 +16,8 @@ pub(crate) const PROOF_GENERATION_DATA_PATH: &str = "/proof_generation_data";
 pub(crate) const SUBMIT_PROOF_PATH: &str = "/submit_proof";
 
 pub(crate) struct PeriodicApiStruct {
-    pub(crate) blob_store: Box<dyn ObjectStore>,
-    pub(crate) pool: ConnectionPool,
+    pub(crate) blob_store: Arc<dyn ObjectStore>,
+    pub(crate) pool: ConnectionPool<Prover>,
     pub(crate) api_url: String,
     pub(crate) poll_duration: Duration,
     pub(crate) client: Client,
